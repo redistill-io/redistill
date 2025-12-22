@@ -7,10 +7,10 @@ bind = "0.0.0.0"  # Bind address (use "0.0.0.0" for all interfaces)
 port = 6379         # Port to listen on
 
 # Performance settings
-num_shards = 256        # Number of shards for parallel access
-batch_size = 256        # Commands to batch before flushing (optimal for high pipelines)
-buffer_size = 16384     # Buffer size in bytes (16KB)
-buffer_pool_size = 1024 # Number of pre-allocated buffers (optimal for most workloads)
+num_shards = 256        # Number of shards for parallel access (CPU cores × 8)
+batch_size = 256        # Commands to batch before flushing (match pipeline depth)
+buffer_size = 16384     # Buffer size in bytes (16KB standard)
+buffer_pool_size = 2048 # Number of pre-allocated buffers (2048 = better tail latency)
 
 # Connection settings
 max_connections = 10000      # Maximum concurrent connections (0 = unlimited)
