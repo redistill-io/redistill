@@ -8,9 +8,9 @@ port = 6379         # Port to listen on
 
 # Performance settings
 num_shards = 256        # Number of shards for parallel access
-batch_size = 256        # Commands to batch before flushing (increase for deep pipelines)
-buffer_size = 16384     # Buffer size in bytes per connection (16KB)
-buffer_pool_size = 1024 # DEPRECATED: Now using per-connection buffers (zero contention)
+batch_size = 256        # Commands to batch before flushing (optimal for high pipelines)
+buffer_size = 16384     # Buffer size in bytes (16KB)
+buffer_pool_size = 1024 # Number of pre-allocated buffers (optimal for most workloads)
 
 # Connection settings
 max_connections = 10000      # Maximum concurrent connections (0 = unlimited)
