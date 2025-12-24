@@ -1456,10 +1456,17 @@ async fn main() {
 
     println!(
         r#"
-╔══════════════════════════════════════════════════════════════╗
-║          🚀  REDISTILL - Redis Performance, Distilled  🚀   ║
-╚══════════════════════════════════════════════════════════════╝
-
+        
+ /$$$$$$$                  /$$ /$$             /$$     /$$ /$$ /$$
+| $$__  $$                | $$|__/            | $$    |__/| $$| $$
+| $$  \ $$  /$$$$$$   /$$$$$$$ /$$  /$$$$$$$ /$$$$$$   /$$| $$| $$
+| $$$$$$$/ /$$__  $$ /$$__  $$| $$ /$$_____/|_  $$_/  | $$| $$| $$
+| $$__  $$| $$$$$$$$| $$  | $$| $$|  $$$$$$   | $$    | $$| $$| $$
+| $$  \ $$| $$_____/| $$  | $$| $$ \____  $$  | $$ /$$| $$| $$| $$
+| $$  | $$|  $$$$$$$|  $$$$$$$| $$ /$$$$$$$/  |  $$$$/| $$| $$| $$
+|__/  |__/ \_______/ \_______/|__/|_______/    \___/  |__/|__/|__/
+                                                                  
+══════════════════════════════════════════════════════════════════
 📊 Configuration:
    • Bind Address: {}:{}
    • Shards: {}
@@ -1472,17 +1479,6 @@ async fn main() {
    • TCP NoDelay: {}
    • Max Memory: {}
    • Eviction Policy: {}
-
-⚡ Optimizations:
-   ✓ DashMap lock-free concurrent hashmap
-   ✓ Zero-copy Bytes (no string allocations)
-   ✓ Buffer pooling (no allocations)
-   ✓ Batched writes ({} commands per flush)
-   ✓ Sharded storage ({} shards)
-   ✓ FNV-1a fast hashing
-   ✓ Inline everything
-   ✓ Fast case-insensitive matching
-   ✓ jemalloc allocator
 
 🎯 Performance: 2x faster than Redis with pipelining!
 "#,
@@ -1513,9 +1509,7 @@ async fn main() {
         } else {
             "unlimited".to_string()
         },
-        config.memory.eviction_policy,
-        config.server.batch_size,
-        config.server.num_shards
+        config.memory.eviction_policy
     );
 
     // Load TLS configuration if enabled
