@@ -1,0 +1,53 @@
+# Git
+.git
+.gitignore
+.github
+
+# Rust
+target/
+# Note: Cargo.lock is needed for reproducible builds, so we include it
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Tests
+tests/
+*.rs.bk
+
+# Build artifacts
+*.tar.gz
+*.zip
+*.exe
+dump.rdb
+
+# Config files (will be mounted or set via env vars)
+redistill.toml
+redistill-custom.toml
+
+# Certificates (should be mounted as volumes)
+*.pem
+*.key
+*.crt
+
+# CI/CD
+.circleci
+.travis.yml
+
+# Other
+*.log
+tmp/
+temp/
+

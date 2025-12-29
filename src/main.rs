@@ -283,6 +283,65 @@ impl Config {
             config.server.bind = bind;
         }
 
+        if let Ok(health_port) = std::env::var("REDIS_HEALTH_CHECK_PORT") {
+            if let Ok(p) = health_port.parse() {
+                config.server.health_check_port = p;
+            }
+        }
+
+        // Performance tuning via environment variables
+        if let Ok(num_shards) = std::env::var("REDIS_NUM_SHARDS") {
+            if let Ok(n) = num_shards.parse() {
+                config.server.num_shards = n;
+            }
+        }
+
+        if let Ok(batch_size) = std::env::var("REDIS_BATCH_SIZE") {
+            if let Ok(b) = batch_size.parse() {
+                config.server.batch_size = b;
+            }
+        }
+
+        if let Ok(buffer_size) = std::env::var("REDIS_BUFFER_SIZE") {
+            if let Ok(b) = buffer_size.parse() {
+                config.server.buffer_size = b;
+            }
+        }
+
+        if let Ok(buffer_pool_size) = std::env::var("REDIS_BUFFER_POOL_SIZE") {
+            if let Ok(b) = buffer_pool_size.parse() {
+                config.server.buffer_pool_size = b;
+            }
+        }
+
+        if let Ok(max_connections) = std::env::var("REDIS_MAX_CONNECTIONS") {
+            if let Ok(m) = max_connections.parse() {
+                config.server.max_connections = m;
+            }
+        }
+
+        // Memory management via environment variables
+        if let Ok(max_memory) = std::env::var("REDIS_MAX_MEMORY") {
+            if let Ok(m) = max_memory.parse() {
+                config.memory.max_memory = m;
+            }
+        }
+
+        if let Ok(eviction_policy) = std::env::var("REDIS_EVICTION_POLICY") {
+            config.memory.eviction_policy = eviction_policy;
+        }
+
+        // Performance settings via environment variables
+        if let Ok(tcp_nodelay) = std::env::var("REDIS_TCP_NODELAY") {
+            config.performance.tcp_nodelay = tcp_nodelay.parse().unwrap_or(true);
+        }
+
+        if let Ok(tcp_keepalive) = std::env::var("REDIS_TCP_KEEPALIVE") {
+            if let Ok(k) = tcp_keepalive.parse() {
+                config.performance.tcp_keepalive = k;
+            }
+        }
+
         // Validate configuration
         config.validate()?;
 

@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  redistill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: redistill:local
+    container_name: redistill-test
+    ports:
+      - "6379:6379"   # Redis protocol
+      - "8080:8080"   # Health check
+    environment:
+      # Network Configuration
+      - REDIS_BIND=0.0.0.0
+      - REDIS_PORT=6379
+      - REDIS_HEALTH_CHECK_PORT=8080
+      
+      # Performance Tuning (Optimal settings - already set in Dockerfile)
+      # These can be overridden here if needed:
+      # - REDIS_NUM_SHARDS=2048          # 2048 for balanced, 4096 for GET-heavy
+      # - REDIS_BATCH_SIZE=256           # Match pipeline depth
+      # - REDIS_BUFFER_SIZE=16384        # 16KB per buffer
+      # - REDIS_BUFFER_POOL_SIZE=2048    # Optimal for tail latency
+      
+      # Connection & Memory Management
+      # - REDIS_MAX_CONNECTIONS=10000    # Max concurrent connections
+      # - REDIS_MAX_MEMORY=0             # 0 = unlimited, or set bytes (e.g., 2147483648 for 2GB)
+      # - REDIS_EVICTION_POLICY=allkeys-lru  # allkeys-lru, allkeys-random, noeviction
+      
+      # Security
+      # - REDIS_PASSWORD=your-password-here  # Uncomment to set password
+    volumes:
+      # Optional: Mount config file
+      # - ./redistill.toml:/app/redistill.toml:ro
+      # Optional: Mount data directory (if you add persistence later)
+      # - redistill-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Uncomment to limit resources
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
+    #     reservations:
+    #       memory: 1G
+
+# volumes:
+#   redistill-data:
+
