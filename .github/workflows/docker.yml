@@ -3,7 +3,7 @@ name: Docker Build and Push
 on:
   push:
     tags:
-      - 'release*'
+      - 'v*'
 
 env:
   REGISTRY: docker.io
@@ -28,22 +28,30 @@ jobs:
         id: get_version
         shell: bash
         run: |
-          # Extract version from tag (e.g., release-1.0.9 -> 1.0.9, release-v1.0.9 -> 1.0.9, release -> release)
+          # Extract version from tag (e.g., v1.0.9 -> 1.0.9, v1.0 -> 1.0.0)
           TAG_NAME=${GITHUB_REF#refs/tags/}
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           
-          # Try to extract version number
-          if [[ "$TAG_NAME" =~ release-?v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+          # Remove 'v' prefix if present and extract version
+          if [[ "$TAG_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            # Full version: v1.0.9 -> 1.0.9
             VERSION="${BASH_REMATCH[1]}"
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "has_version=true" >> $GITHUB_OUTPUT
-          elif [[ "$TAG_NAME" =~ release-([0-9]+)\.([0-9]+) ]]; then
-            # Handle release-1.0 format
+          elif [[ "$TAG_NAME" =~ ^v([0-9]+)\.([0-9]+)$ ]]; then
+            # Minor version: v1.0 -> 1.0.0
             VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.0"
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "has_version=true" >> $GITHUB_OUTPUT
+          elif [[ "$TAG_NAME" =~ ^v([0-9]+)$ ]]; then
+            # Major version: v1 -> 1.0.0
+            VERSION="${BASH_REMATCH[1]}.0.0"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "has_version=true" >> $GITHUB_OUTPUT
           else
-            echo "version=$TAG_NAME" >> $GITHUB_OUTPUT
+            # Fallback: use tag as-is (without v prefix)
+            VERSION="${TAG_NAME#v}"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "has_version=false" >> $GITHUB_OUTPUT
           fi
 
@@ -95,8 +103,6 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             BUILDKIT_INLINE_CACHE=1
-          # Note: Multi-arch builds will automatically handle cross-compilation
-          # Each platform will build natively in its own builder instance
 
       - name: Image digest
         run: echo "Built and pushed images: ${{ steps.tags.outputs.tags }}"
