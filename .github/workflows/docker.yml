@@ -101,9 +101,8 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
 
       - name: Image digest
-        run: echo "Built and pushed images: ${{ steps.tags.outputs.tags }}"
-
+        run: |
+          echo "Built and pushed images:"
+          echo "${{ steps.tags.outputs.tags }}"
