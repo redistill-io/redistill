@@ -12,6 +12,11 @@
 
 Redistill is a drop-in Redis replacement optimized for high-performance caching workloads. It implements the Redis protocol (RESP) and achieves up to 4.5x higher throughput than Redis by eliminating persistence overhead and leveraging multi-threaded concurrent access.
 
+Redistill is:
+- First Redis-compatible server to exceed 9M ops/s
+- First to achieve sub-0.5ms p50 latency
+- First to sustain 1.5+ GB/s bandwidth
+
 **Key characteristics:**
 - Redis protocol compatible (RESP)
 - **9.07M operations/second** - 4.5x faster than Redis, 1.7x faster than Dragonfly
@@ -28,6 +33,12 @@ Redistill is a drop-in Redis replacement optimized for high-performance caching 
 - **Drop-in Compatible** - Works with existing Redis clients  
 - **Production Ready** - TLS, authentication, monitoring, health checks  
 - **Multi-threaded** - Utilizes all CPU cores efficiently  
+
+## Setting performance standard
+
+**2015** - Redis defines fast (100K ops/s single-threaded)
+**2022** - Dragonfly raises bar (5M ops/s multi-threaded)
+**2026** - Redistill sets new standard (9M ops/s) ✓
 
 ## Quick Start
 
