@@ -369,14 +369,14 @@ redis-cli INFO memory
 
 ## Documentation
 
-- 📚 [Quick Start Guide](docs/QUICKSTART.md) - Get started in 5 minutes
-- ⚡ [Performance Benchmarks](docs/BENCHMARKS.md) - Detailed benchmark results
-- 🎯 [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) - Optimize for your workload
-- 🏗️ [Architecture & Design](docs/ARCHITECTURE.md) - How Redistill works
-- 📝 [Practical Examples](docs/EXAMPLES.md) - Real-world code examples
-- 🚀 [Production Guide](docs/PRODUCTION_GUIDE.md) - Deployment best practices
-- ⚙️ [Configuration Reference](docs/CONFIG.md) - Complete configuration options
-- ✨ [Features](docs/FEATURES.md) - Supported features and roadmap
+- [Quick Start Guide](docs/QUICKSTART.md) - Get started in 5 minutes
+- [Performance Benchmarks](docs/BENCHMARKS.md) - Detailed benchmark results
+- [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) - Optimize for your workload
+- [Architecture & Design](docs/ARCHITECTURE.md) - How Redistill works
+- [Practical Examples](docs/EXAMPLES.md) - Real-world code examples
+- [Production Guide](docs/PRODUCTION_GUIDE.md) - Deployment best practices
+- [Configuration Reference](docs/CONFIG.md) - Complete configuration options
+- [Features](docs/FEATURES.md) - Supported features and roadmap
 
 ## Frequently Asked Questions
 
