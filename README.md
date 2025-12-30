@@ -6,6 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/shaikh-shahid/redistill/workflows/CI/badge.svg)](https://github.com/shaikh-shahid/redistill/actions/workflows/ci.yml)
 [![Release](https://github.com/shaikh-shahid/redistill/workflows/Release/badge.svg)](https://github.com/shaikh-shahid/redistill/actions/workflows/release.yml)
+[![Docker](https://img.shields.io/docker/pulls/shahidshaikh/redistill)](https://hub.docker.com/r/shahidshaikh/redistill)
 
 ## Overview
 
@@ -106,34 +107,155 @@ eviction_policy = "allkeys-lru" # LRU eviction
 - `batch_size`: Match your pipeline depth (256 optimal for P > 64)
 - `buffer_pool_size`: 2048 for best tail latency
 
-## Quick Start
+## Installation
 
-Download the suitable binaries for your machine and operating system from [Release](https://github.com/shaikh-shahid/Redistill/releases) page.
+Redistill can be installed via multiple methods. Choose the one that best fits your environment:
 
-Or you can build the project from source code.
+### 🐳 Docker (Recommended)
 
-### Requirements
+The easiest way to run Redistill with optimal performance settings:
 
+```bash
+# Pull the latest image
+docker pull shahidontech/redistill:latest
+
+# Run with default settings
+docker run -d --name redistill \
+  -p 6379:6379 \
+  -p 8080:8080 \
+  shahidontech/redistill:latest
+
+# Run with custom password
+docker run -d --name redistill \
+  -p 6379:6379 \
+  -e REDIS_PASSWORD=your-password \
+  shahidontech/redistill:latest
+
+# Run with custom memory limit (2GB)
+docker run -d --name redistill \
+  -p 6379:6379 \
+  -e REDIS_MAX_MEMORY=2147483648 \
+  shahidontech/redistill:latest
+```
+
+**Docker Compose:**
+
+```yaml
+version: '3.8'
+services:
+  redistill:
+    image: shahidontech/redistill:latest
+    ports:
+      - "6379:6379"
+      - "8080:8080"
+    environment:
+      - REDIS_PASSWORD=your-password
+      - REDIS_MAX_MEMORY=2147483648
+```
+
+**Available tags:**
+- `latest` - Latest stable release
+- `1.1.2` - Specific version
+- `1.1` - Latest 1.1.x release
+- `1` - Latest 1.x release
+
+### 🍺 Homebrew (macOS)
+
+Install on macOS using Homebrew:
+
+```bash
+# Add the tap
+brew tap shaikh-shahid/redistill
+
+# Install Redistill
+brew install redistill
+
+# Start Redistill
+redistill
+
+# Or run as a service
+brew services start redistill
+```
+
+**Update:**
+```bash
+brew update
+brew upgrade redistill
+```
+
+### 📦 Direct Binary Download
+
+Download pre-built binaries for your platform:
+
+**Linux:**
+```bash
+# Download latest release
+wget https://github.com/shaikh-shahid/redistill/releases/download/v1.1.2/redistill-1.1.2-x86_64-unknown-linux-musl.tar.gz
+
+# Extract
+tar -xzf redistill-1.1.2-x86_64-unknown-linux-musl.tar.gz
+
+# Make executable
+chmod +x redistill
+
+# Run
+./redistill
+```
+
+**macOS:**
+```bash
+# Intel Macs
+wget https://github.com/shaikh-shahid/redistill/releases/download/v1.1.2/redistill-1.1.2-x86_64-apple-darwin.tar.gz
+
+# Apple Silicon (M1/M2/M3)
+wget https://github.com/shaikh-shahid/redistill/releases/download/v1.1.2/redistill-1.1.2-aarch64-apple-darwin.tar.gz
+
+# Extract and run
+tar -xzf redistill-*.tar.gz
+chmod +x redistill
+./redistill
+```
+
+**Windows:**
+```powershell
+# Download
+Invoke-WebRequest -Uri "https://github.com/shaikh-shahid/redistill/releases/download/v1.1.2/redistill-1.1.2-x86_64-pc-windows-msvc.zip" -OutFile "redistill.zip"
+
+# Extract
+Expand-Archive redistill.zip
+
+# Run
+.\redistill.exe
+```
+
+Browse all releases: [GitHub Releases](https://github.com/shaikh-shahid/redistill/releases)
+
+### 🔨 Build from Source
+
+Build Redistill from source code:
+
+**Requirements:**
 - Rust 1.70 or higher
-- Linux, macOS, or Windows
 - 1GB RAM minimum (configurable)
-
-### Installation
 
 ```bash
 # Install Rust if needed
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.sh | sh
 
-# Build from source
-git clone https://github.com/yourusername/redistill
+# Clone repository
+git clone https://github.com/shaikh-shahid/redistill
 cd redistill
+
+# Build release binary
 cargo build --release
 
 # Run server
 ./target/release/redistill
 ```
 
-### Basic Usage
+## Quick Start
+
+After installation, test your Redistill server:
 
 ```bash
 # Test connection
@@ -146,6 +268,9 @@ redis-cli set mykey "hello world"
 
 redis-cli get mykey
 # "hello world"
+
+# Check health endpoint (if enabled)
+curl http://localhost:8080/health
 ```
 
 ## Configuration
