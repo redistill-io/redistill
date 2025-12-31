@@ -36,9 +36,9 @@ Redistill is:
 
 ## Setting performance standard
 
-**2015** - Redis defines fast (100K ops/s single-threaded)
-**2022** - Dragonfly raises bar (5M ops/s multi-threaded)
-**2026** - Redistill sets new standard (9M ops/s) ✓
+- **2015**: Redis defines fast (100K ops/s single-threaded)
+- **2022**: Dragonfly raises bar (5M ops/s multi-threaded)
+- **2026**: Redistill sets new standard (9M ops/s)
 
 ## Quick Start
 
