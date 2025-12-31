@@ -3,6 +3,7 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use ahash::AHasher;
 use bytes::{Buf, Bytes, BytesMut};
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
@@ -14,6 +15,7 @@ use hyper_util::rt::TokioIo;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::hash::Hasher;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -470,15 +472,12 @@ impl ShardedStore {
         }
     }
 
-    // Fast FNV-1a hash
+    // Fast AHash with hardware acceleration (AES-NI)
     #[inline(always)]
     fn hash(&self, key: &[u8]) -> usize {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for &byte in key {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash as usize % self.num_shards
+        let mut hasher = AHasher::default();
+        hasher.write(key);
+        hasher.finish() as usize % self.num_shards
     }
 
     /// Set a key-value pair. Returns the old entry's size if it existed (for memory tracking).

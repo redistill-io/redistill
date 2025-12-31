@@ -1,6 +1,6 @@
 [package]
 name = "redistill"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 authors = ["Shahid Shaikh"]
 description = "High-performance Redis-compatible key-value store that outperforms Redis"

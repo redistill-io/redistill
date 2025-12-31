@@ -4,9 +4,11 @@
 
 #![allow(dead_code)] // Some items may only be used in tests
 
+use ahash::AHasher;
 pub use bytes::{Bytes, BytesMut};
 pub use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -270,15 +272,12 @@ impl ShardedStore {
         }
     }
 
-    // Fast FNV-1a hash
+    // Fast AHash with hardware acceleration (AES-NI)
     #[inline(always)]
     pub fn hash(&self, key: &[u8]) -> usize {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for &byte in key {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash as usize % self.num_shards
+        let mut hasher = AHasher::default();
+        hasher.write(key);
+        hasher.finish() as usize % self.num_shards
     }
 
     #[inline(always)]

@@ -74,11 +74,13 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - DashMap: Concurrent hash map with fine-grained locking
 - Multiple shards (default 2048) for reduced contention
 - Read operations don't block each other
+- AHash for hardware-accelerated hashing (AES-NI instructions)
 
 **Impact:**
 - Concurrent GET operations scale linearly with cores
 - Minimal contention on different keys
 - Optimized for read-heavy workloads
+- 2-4x faster hashing than traditional algorithms
 - Slightly higher memory per shard
 
 **Shard Count Impact:**
