@@ -150,6 +150,12 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 | **Multi-core utilization** | Better hardware efficiency |
 | **Lower infrastructure cost** | 50-83% cost savings vs alternatives |
 
+**Important Note on Performance Claims:**
+- Redistill is the **fastest single-instance** Redis-compatible server (9.07M ops/s per instance)
+- Performance comparisons (4.5x vs Redis, 1.7x vs Dragonfly) are **single-instance** benchmarks
+- Redis Cluster or Dragonfly with clustering can achieve higher **total throughput** by scaling horizontally across multiple instances
+- However, **per-instance**, Redistill delivers the highest performance, meaning you need fewer instances to achieve the same throughput
+
 ### What You Lose
 
 | Feature | Impact | Mitigation |
@@ -185,8 +191,9 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Redistill loses data on restart
 
 **Need replication/clustering**
-- Redis has built-in clustering
-- Redistill requires manual sharding
+- Redis has built-in clustering (can scale to higher total throughput with multiple instances)
+- Dragonfly supports clustering (can achieve higher aggregate throughput across cluster)
+- Redistill requires manual sharding (no built-in clustering, but single-instance performance is highest)
 
 **Complex data structures**
 - Redis supports Lists, Sets, Hashes, Sorted Sets
@@ -252,16 +259,17 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 | Requirement | Redistill | Redis |
 |-------------|-----------|-------|
-| Maximum throughput | Best choice | Slower |
-| Lowest latency | Best choice | Higher p50/p99 |
-| Read-heavy workload (80%+ reads) | 2-4x faster | Slower |
+| Maximum throughput (single-instance) | **Best choice** (9.07M ops/s) | Slower (2.03M ops/s) |
+| Maximum throughput (clustered) | Manual sharding required | Redis Cluster scales horizontally |
+| Lowest latency (p50) | **Best choice** (0.48ms) | Higher p50/p99 (2.38ms) |
+| Read-heavy workload (80%+ reads) | 2-4x faster per instance | Slower per instance |
 | Write-heavy workload (>50% writes) | Good | Better at extreme scale |
 | Need persistence | Not supported | AOF/RDB |
 | Need replication | Not built-in | Built-in |
-| Need clustering | Manual sharding | Redis Cluster |
+| Need clustering | Manual sharding | Redis Cluster (built-in) |
 | Complex data types | Strings only | Lists, Sets, Hashes, etc. |
 | Drop-in Redis replacement | For caching | Check feature compatibility |
-| Cost efficiency | 50-83% savings | Higher costs |
+| Cost efficiency | 50-83% savings (fewer instances needed) | Higher costs |
 | Multi-core utilization | All cores | Single threaded |
 
 ## Technical Implementation Details

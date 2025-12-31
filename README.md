@@ -1,6 +1,6 @@
 # Redistill
 
-> A high-performance, Redis-compatible in-memory cache written in Rust. Up to 4.5x faster than Redis, outperforming both Redis and Dragonfly.
+> A high-performance, Redis-compatible in-memory cache written in Rust. The fastest single-instance Redis-compatible server - up to 4.5x faster than Redis, outperforming both Redis and Dragonfly per instance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -13,9 +13,12 @@
 Redistill is a drop-in Redis replacement optimized for high-performance caching workloads. It implements the Redis protocol (RESP) and achieves up to 4.5x higher throughput than Redis by eliminating persistence overhead and leveraging multi-threaded concurrent access.
 
 Redistill is:
-- First Redis-compatible server to exceed 9M ops/s
+- **Fastest single-instance** Redis-compatible server (9.07M ops/s per instance)
+- First Redis-compatible server to exceed 9M ops/s on a single instance
 - First to achieve sub-0.5ms p50 latency
 - First to sustain 1.5+ GB/s bandwidth
+
+> **Note:** Performance comparisons are single-instance benchmarks. Redis Cluster or Dragonfly with clustering can achieve higher total throughput by scaling horizontally, but Redistill delivers the highest per-instance performance, requiring fewer instances for the same throughput.
 
 **Key characteristics:**
 - Redis protocol compatible (RESP)
@@ -27,9 +30,9 @@ Redistill is:
 
 ## Why Redistill?
 
-- **Maximum Performance** - 4.5x faster than Redis, 1.7x faster than Dragonfly  
+- **Maximum Single-Instance Performance** - 4.5x faster than Redis, 1.7x faster than Dragonfly per instance  
 - **Lower Latency** - Sub-millisecond p50 latency (0.48ms)  
-- **Cost Efficient** - 50-83% infrastructure savings  
+- **Cost Efficient** - 50-83% infrastructure savings (fewer instances needed)  
 - **Drop-in Compatible** - Works with existing Redis clients  
 - **Production Ready** - TLS, authentication, monitoring, health checks  
 - **Multi-threaded** - Utilizes all CPU cores efficiently  
@@ -413,15 +416,18 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 
 | Feature | Redistill | Dragonfly | Redis |
 |---------|-----------|-----------|-------|
-| Throughput (pipelined) | **9.1M ops/s** | 5.4M ops/s | 2.0M ops/s |
+| Throughput (pipelined, single-instance) | **9.1M ops/s** | 5.4M ops/s | 2.0M ops/s |
+| Throughput (clustered) | Manual sharding | Scales horizontally | Redis Cluster scales horizontally |
 | Latency (p50) | **0.48ms** | 0.81ms | 2.38ms |
 | Concurrency model | Multi-threaded | Multi-threaded | Single-threaded |
 | Persistence | No | Yes | Yes (AOF/RDB) |
 | Replication | No | Yes | Yes |
-| Clustering | No | Yes | Yes |
+| Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
 | Data types | String (KV) | Full Redis | Full Redis |
 | Best for | Read-heavy caching | General purpose | General purpose |
 | License | MIT | BSL | BSD |
+
+> **Performance Note:** All throughput numbers are single-instance benchmarks. Redis Cluster and Dragonfly clustering can achieve higher aggregate throughput across multiple instances, but Redistill delivers the highest per-instance performance, meaning fewer instances are needed for the same total throughput.
 
 **When to Use Redistill:**
 - High-performance caching (session storage, API responses)
