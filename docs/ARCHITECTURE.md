@@ -25,7 +25,7 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 ## Architecture Overview
 
-![Redistill Architecture](Redistill_Architecture.png "Redistill Architecture")
+![Redistill Architecture](img/Redistill_Architecture.png "Redistill Architecture")
 
 ## Performance Optimizations
 

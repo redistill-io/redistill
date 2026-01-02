@@ -119,28 +119,13 @@ Independent comparison on **AWS c7i.16xlarge** (Intel, 64 cores, 128GB RAM) usin
 ### Benchmark Visualization
 
 **Throughput Comparison (Higher is Better)**
-
-```
-Redis       ████████████ 2.0M ops/s  (100%)
-Dragonfly   ████████████████████████████████ 5.4M ops/s  (270%)
-Redistill   ████████████████████████████████████████████████████████ 9.1M ops/s  (455%) ⭐
-```
+![Throughput](docs/img/throughput.png "Throughput")
 
 **Latency Comparison - p50 (Lower is Better)**
-
-```
-Redistill   ████████████ 0.479 ms  (100%) ⭐ Best
-Dragonfly   ████████████████████████████ 0.807 ms  (168%)
-Redis       ████████████████████████████████████████████████████████ 2.383 ms  (497%)
-```
+![Latency](docs/img/latency.png "Latency")
 
 **Bandwidth Comparison (Higher is Better)**
-
-```
-Redis       ████████████ 338 MB/s  (100%)
-Dragonfly   ████████████████████████████████ 923 MB/s  (273%)
-Redistill   ████████████████████████████████████████████████████████ 1,580 MB/s  (467%) ⭐
-```
+![Bandwidth](docs/img/bandwidth.png "Bandwidth")
 
 > 💡 **Note:** Percentages show relative performance vs Redis baseline. All tests run on identical hardware (c7i.16xlarge) with same configuration.
 
