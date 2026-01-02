@@ -1,6 +1,6 @@
 # Redistill
 
-> A high-performance, Redis-compatible in-memory cache written in Rust. The fastest single-instance Redis-compatible server - up to 4.5x faster than Redis, outperforming both Redis and Dragonfly per instance.
+> A high-performance, in-memory key-value database written in Rust. Redis-compatible and the fastest single-instance KV database - up to 4.5x faster than Redis, outperforming both Redis and Dragonfly per instance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
@@ -10,18 +10,19 @@
 
 ## Overview
 
-Redistill is a drop-in Redis replacement optimized for high-performance caching workloads. It implements the Redis protocol (RESP) and achieves up to 4.5x higher throughput than Redis by eliminating persistence overhead and leveraging multi-threaded concurrent access.
+Redistill is a high-performance in-memory key-value database optimized for maximum throughput and minimal latency. It implements the Redis protocol (RESP) for seamless compatibility with existing Redis clients, and achieves up to 4.5x higher throughput than Redis by eliminating persistence overhead and leveraging multi-threaded concurrent access.
 
 Redistill is:
-- **Fastest single-instance** Redis-compatible server (9.07M ops/s per instance)
-- First Redis-compatible server to exceed 9M ops/s on a single instance
+- **Fastest single-instance** in-memory KV database (9.07M ops/s per instance)
+- First KV database to exceed 9M ops/s on a single instance
 - First to achieve sub-0.5ms p50 latency
 - First to sustain 1.5+ GB/s bandwidth
 
 > **Note:** Performance comparisons are single-instance benchmarks. Redis Cluster or Dragonfly with clustering can achieve higher total throughput by scaling horizontally, but Redistill delivers the highest per-instance performance, requiring fewer instances for the same throughput.
 
 **Key characteristics:**
-- Redis protocol compatible (RESP)
+- High-performance in-memory key-value database
+- Redis protocol compatible (RESP) - works with all Redis clients
 - **9.07M operations/second** - 4.5x faster than Redis, 1.7x faster than Dragonfly
 - **5x lower latency** (p50: 0.48ms vs Redis 2.38ms)
 - Multi-threaded architecture with lock-free reads
@@ -30,6 +31,7 @@ Redistill is:
 
 ## Why Redistill?
 
+- **High-Performance KV Database** - Fastest in-memory key-value database available
 - **Maximum Single-Instance Performance** - 4.5x faster than Redis, 1.7x faster than Dragonfly per instance  
 - **Lower Latency** - Sub-millisecond p50 latency (0.48ms)  
 - **Cost Efficient** - 50-83% infrastructure savings (fewer instances needed)  
@@ -132,6 +134,8 @@ Independent comparison on **AWS c7i.16xlarge** (Intel, 64 cores, 128GB RAM) usin
 > 📈 For detailed benchmarks and testing methodology, see [Benchmarks Documentation](docs/BENCHMARKS.md).
 
 ## Use Cases
+
+Redistill is a high-performance key-value database perfect for applications requiring maximum speed and minimal latency.
 
 ### Perfect For
 
@@ -401,6 +405,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 
 | Feature | Redistill | Dragonfly | Redis |
 |---------|-----------|-----------|-------|
+| Type | **In-memory KV database** | In-memory data store | In-memory data store |
 | Throughput (pipelined, single-instance) | **9.1M ops/s** | 5.4M ops/s | 2.0M ops/s |
 | Throughput (clustered) | Manual sharding | Scales horizontally | Redis Cluster scales horizontally |
 | Latency (p50) | **0.48ms** | 0.81ms | 2.38ms |
@@ -409,13 +414,14 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | Replication | No | Yes | Yes |
 | Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
 | Data types | String (KV) | Full Redis | Full Redis |
-| Best for | Read-heavy caching | General purpose | General purpose |
+| Best for | High-performance KV workloads | General purpose | General purpose |
 | License | MIT | BSL | BSD |
 
 > **Performance Note:** All throughput numbers are single-instance benchmarks. Redis Cluster and Dragonfly clustering can achieve higher aggregate throughput across multiple instances, but Redistill delivers the highest per-instance performance, meaning fewer instances are needed for the same total throughput.
 
 **When to Use Redistill:**
-- High-performance caching (session storage, API responses)
+- High-performance key-value database needs (session storage, API responses)
+- Maximum KV database performance and throughput
 - Read-heavy workloads (70%+ reads)
 - Ephemeral data that can be regenerated
 - Maximum throughput and minimum latency
