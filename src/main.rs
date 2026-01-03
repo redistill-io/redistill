@@ -799,6 +799,18 @@ impl RespWriter {
     }
 
     #[inline(always)]
+    fn write_signed_integer(&mut self, i: i64) {
+        self.buffer.push(b':');
+        if i < 0 {
+            self.buffer.push(b'-');
+            self.write_u64((-i) as u64);
+        } else {
+            self.write_u64(i as u64);
+        }
+        self.buffer.extend_from_slice(b"\r\n");
+    }
+
+    #[inline(always)]
     fn write_error(&mut self, s: &[u8]) {
         self.buffer.extend_from_slice(b"-ERR ");
         self.buffer.extend_from_slice(s);
@@ -941,6 +953,50 @@ fn format_bytes(bytes: u64) -> String {
 #[inline(always)]
 fn eq_ignore_case_3(a: &[u8], b: &[u8; 3]) -> bool {
     a.len() == 3 && (a[0] | 0x20) == b[0] && (a[1] | 0x20) == b[1] && (a[2] | 0x20) == b[2]
+}
+
+// Parse bytes as u64 with overflow protection
+#[inline(always)]
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val = 0u64;
+    for &b in bytes.iter() {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(val)
+}
+
+// Parse bytes as i64 with overflow protection
+#[inline(always)]
+fn parse_i64(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let (negative, start) = if bytes[0] == b'-' {
+        (true, 1)
+    } else {
+        (false, 0)
+    };
+    if start >= bytes.len() {
+        return None;
+    }
+    let mut val = 0i64;
+    for &b in bytes[start..].iter() {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+    }
+    if negative {
+        Some(-val)
+    } else {
+        Some(val)
+    }
 }
 
 #[inline(always)]
@@ -1187,57 +1243,167 @@ fn execute_command(
                         return;
                     }
 
-                    let mut ttl = None;
-                    if command.len() >= 5 && command[3].len() == 2 {
-                        let ex = &command[3];
-                        if (ex[0] | 0x20) == b'e' && (ex[1] | 0x20) == b'x' {
-                            // Parse TTL strictly - error on invalid format or overflow
-                            let ttl_bytes = &command[4];
-                            let mut val = 0u64;
-                            let mut valid = true;
+                    // Parse options: EX, PX, NX, XX, GET
+                    let mut ttl: Option<u64> = None;
+                    let mut nx = false;  // Only set if Not eXists
+                    let mut xx = false;  // Only set if eXists
+                    let mut get = false; // Return old value
+                    
+                    let mut i = 3;
+                    while i < command.len() {
+                        let opt = &command[i];
+                        let opt_len = opt.len();
+                        
+                        if opt_len == 2 {
+                            let o0 = opt[0] | 0x20;
+                            let o1 = opt[1] | 0x20;
                             
-                            // Check all bytes are digits with overflow protection
-                            if ttl_bytes.is_empty() {
-                                valid = false;
-                            } else {
-                                for &b in ttl_bytes.iter() {
-                                    if !(b'0'..=b'9').contains(&b) {
-                                        valid = false;
-                                        break;
-                                    }
-                                    // Use checked arithmetic to prevent overflow
-                                    match val.checked_mul(10).and_then(|v| v.checked_add((b - b'0') as u64)) {
-                                        Some(new_val) => val = new_val,
-                                        None => {
-                                            valid = false;
-                                            break;
-                                        }
+                            if o0 == b'e' && o1 == b'x' {
+                                // EX seconds
+                                if i + 1 >= command.len() {
+                                    writer.write_error(b"syntax error");
+                                    return;
+                                }
+                                i += 1;
+                                match parse_u64(&command[i]) {
+                                    Some(v) if v > 0 => ttl = Some(v),
+                                    _ => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
                                     }
                                 }
-                            }
-                            
-                            if !valid || val == 0 {
-                                writer.write_error(b"value is not an integer or out of range");
+                            } else if o0 == b'p' && o1 == b'x' {
+                                // PX milliseconds
+                                if i + 1 >= command.len() {
+                                    writer.write_error(b"syntax error");
+                                    return;
+                                }
+                                i += 1;
+                                match parse_u64(&command[i]) {
+                                    Some(v) if v > 0 => {
+                                        // Convert ms to seconds (round up)
+                                        ttl = Some((v + 999) / 1000);
+                                    }
+                                    _ => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
+                                    }
+                                }
+                            } else if o0 == b'n' && o1 == b'x' {
+                                nx = true;
+                            } else if o0 == b'x' && o1 == b'x' {
+                                xx = true;
+                            } else {
+                                writer.write_error(b"syntax error");
                                 return;
                             }
-                            
-                            ttl = Some(val);
+                        } else if opt_len == 3 && (opt[0] | 0x20) == b'g' && (opt[1] | 0x20) == b'e' && (opt[2] | 0x20) == b't' {
+                            get = true;
+                        } else {
+                            writer.write_error(b"syntax error");
+                            return;
                         }
+                        i += 1;
+                    }
+                    
+                    // NX and XX are mutually exclusive
+                    if nx && xx {
+                        writer.write_error(b"XX and NX options at the same time are not compatible");
+                        return;
+                    }
+                    
+                    // Check NX/XX conditions
+                    let shard = &store.shards[store.hash(key)];
+                    let old_value = if nx || xx || get {
+                        shard.get(key.as_ref()).and_then(|entry| {
+                            // Check if expired
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    return None;
+                                }
+                            }
+                            Some(entry.value.clone())
+                        })
+                    } else {
+                        None
+                    };
+                    
+                    let key_exists = old_value.is_some();
+                    
+                    // NX: only set if key doesn't exist
+                    if nx && key_exists {
+                        if get {
+                            writer.write_bulk_string(&old_value.unwrap());
+                        } else {
+                            writer.write_null();
+                        }
+                        return;
+                    }
+                    
+                    // XX: only set if key exists
+                    if xx && !key_exists {
+                        if get {
+                            writer.write_null();
+                        } else {
+                            writer.write_null();
+                        }
+                        return;
                     }
 
-                    // Atomic set - returns old entry size if key existed (no race condition)
+                    // Atomic set - returns old entry size if key existed
                     let old_size = store.set(key.clone(), value.clone(), ttl, now);
 
                     // Track memory usage (only if limits enabled)
                     if CONFIG.memory.max_memory > 0 {
-                        // Subtract old size (if key existed), add new size
                         if let Some(old) = old_size {
                             MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
                         }
                         MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
                     }
 
-                    writer.write_simple_string(b"OK");
+                    if get {
+                        match old_value {
+                            Some(v) => writer.write_bulk_string(&v),
+                            None => writer.write_null(),
+                        }
+                    } else {
+                        writer.write_simple_string(b"OK");
+                    }
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_3(cmd, b"ttl") {
+                // TTL key - returns remaining time in seconds
+                if command.len() >= 2 {
+                    let key = &command[1];
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            match entry.expiry {
+                                Some(expiry) => {
+                                    if now >= expiry {
+                                        // Key expired
+                                        drop(entry);
+                                        shard.remove(key.as_ref());
+                                        writer.write_signed_integer(-2);
+                                    } else {
+                                        writer.write_signed_integer((expiry - now) as i64);
+                                    }
+                                }
+                                None => {
+                                    // Key exists but has no TTL
+                                    writer.write_signed_integer(-1);
+                                }
+                            }
+                        }
+                        None => {
+                            // Key doesn't exist
+                            writer.write_signed_integer(-2);
+                        }
+                    }
                 } else {
                     writer.write_error(b"wrong number of arguments");
                 }
@@ -1276,6 +1442,241 @@ fn execute_command(
             if eq_ignore_case_3(&cmd[..3], b"key") && (cmd[3] | 0x20) == b's' {
                 let keys = store.keys(now);
                 writer.write_array(&keys);
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"inc") && (cmd[3] | 0x20) == b'r' {
+                // INCR key
+                if command.len() >= 2 {
+                    let key = &command[1];
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    // Get current value or default to 0
+                    let current = match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            // Check if expired
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    drop(entry);
+                                    shard.remove(key.as_ref());
+                                    0i64
+                                } else {
+                                    match parse_i64(&entry.value) {
+                                        Some(v) => v,
+                                        None => {
+                                            writer.write_error(b"value is not an integer or out of range");
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match parse_i64(&entry.value) {
+                                    Some(v) => v,
+                                    None => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => 0i64,
+                    };
+                    
+                    let new_val = match current.checked_add(1) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"increment would produce overflow");
+                            return;
+                        }
+                    };
+                    
+                    let val_bytes = Bytes::from(new_val.to_string());
+                    let size = entry_size(key.len(), val_bytes.len());
+                    
+                    if !evict_if_needed(store, size) {
+                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        return;
+                    }
+                    
+                    // Preserve existing TTL
+                    let existing_ttl = shard.get(key.as_ref()).and_then(|e| {
+                        e.expiry.map(|exp| if exp > now { exp - now } else { 0 })
+                    });
+                    
+                    let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
+                    
+                    if CONFIG.memory.max_memory > 0 {
+                        if let Some(old) = old_size {
+                            MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
+                        }
+                        MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+                    }
+                    
+                    writer.write_signed_integer(new_val);
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"dec") && (cmd[3] | 0x20) == b'r' {
+                // DECR key
+                if command.len() >= 2 {
+                    let key = &command[1];
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    let current = match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    drop(entry);
+                                    shard.remove(key.as_ref());
+                                    0i64
+                                } else {
+                                    match parse_i64(&entry.value) {
+                                        Some(v) => v,
+                                        None => {
+                                            writer.write_error(b"value is not an integer or out of range");
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match parse_i64(&entry.value) {
+                                    Some(v) => v,
+                                    None => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => 0i64,
+                    };
+                    
+                    let new_val = match current.checked_sub(1) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"decrement would produce overflow");
+                            return;
+                        }
+                    };
+                    
+                    let val_bytes = Bytes::from(new_val.to_string());
+                    let size = entry_size(key.len(), val_bytes.len());
+                    
+                    if !evict_if_needed(store, size) {
+                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        return;
+                    }
+                    
+                    let existing_ttl = shard.get(key.as_ref()).and_then(|e| {
+                        e.expiry.map(|exp| if exp > now { exp - now } else { 0 })
+                    });
+                    
+                    let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
+                    
+                    if CONFIG.memory.max_memory > 0 {
+                        if let Some(old) = old_size {
+                            MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
+                        }
+                        MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+                    }
+                    
+                    writer.write_signed_integer(new_val);
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"ptt") && (cmd[3] | 0x20) == b'l' {
+                // PTTL key - returns remaining time in milliseconds
+                if command.len() >= 2 {
+                    let key = &command[1];
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            match entry.expiry {
+                                Some(expiry) => {
+                                    if now >= expiry {
+                                        drop(entry);
+                                        shard.remove(key.as_ref());
+                                        writer.write_signed_integer(-2);
+                                    } else {
+                                        // Convert seconds to milliseconds
+                                        writer.write_signed_integer(((expiry - now) * 1000) as i64);
+                                    }
+                                }
+                                None => {
+                                    writer.write_signed_integer(-1);
+                                }
+                            }
+                        }
+                        None => {
+                            writer.write_signed_integer(-2);
+                        }
+                    }
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"mge") && (cmd[3] | 0x20) == b't' {
+                // MGET key [key ...]
+                if command.len() >= 2 {
+                    // Write array header
+                    writer.buffer.push(b'*');
+                    writer.write_u64((command.len() - 1) as u64);
+                    writer.buffer.extend_from_slice(b"\r\n");
+                    
+                    for key in &command[1..] {
+                        match store.get(key, now) {
+                            Some(value) => writer.write_bulk_string(&value),
+                            None => writer.write_null(),
+                        }
+                    }
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"mse") && (cmd[3] | 0x20) == b't' {
+                // MSET key value [key value ...]
+                if command.len() >= 3 && (command.len() - 1) % 2 == 0 {
+                    let pairs = (command.len() - 1) / 2;
+                    
+                    // Check memory for all pairs first
+                    let mut total_size = 0;
+                    for i in 0..pairs {
+                        let key = &command[1 + i * 2];
+                        let value = &command[2 + i * 2];
+                        total_size += entry_size(key.len(), value.len());
+                    }
+                    
+                    if !evict_if_needed(store, total_size) {
+                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        return;
+                    }
+                    
+                    // Set all pairs
+                    for i in 0..pairs {
+                        let key = &command[1 + i * 2];
+                        let value = &command[2 + i * 2];
+                        let size = entry_size(key.len(), value.len());
+                        
+                        let old_size = store.set(key.clone(), value.clone(), None, now);
+                        
+                        if CONFIG.memory.max_memory > 0 {
+                            if let Some(old) = old_size {
+                                MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
+                            }
+                            MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+                        }
+                    }
+                    
+                    writer.write_simple_string(b"OK");
+                } else {
+                    writer.write_error(b"wrong number of arguments for MSET");
+                }
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h' {
@@ -1381,6 +1782,207 @@ fn execute_command(
                 writer.buffer.extend_from_slice(b"*0\r\n");
                 return;
             }
+            if eq_ignore_case_6(cmd, b"incrby") {
+                // INCRBY key increment
+                if command.len() >= 3 {
+                    let key = &command[1];
+                    let increment = match parse_i64(&command[2]) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"value is not an integer or out of range");
+                            return;
+                        }
+                    };
+                    
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    let current = match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    drop(entry);
+                                    shard.remove(key.as_ref());
+                                    0i64
+                                } else {
+                                    match parse_i64(&entry.value) {
+                                        Some(v) => v,
+                                        None => {
+                                            writer.write_error(b"value is not an integer or out of range");
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match parse_i64(&entry.value) {
+                                    Some(v) => v,
+                                    None => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => 0i64,
+                    };
+                    
+                    let new_val = match current.checked_add(increment) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"increment or decrement would overflow");
+                            return;
+                        }
+                    };
+                    
+                    let val_bytes = Bytes::from(new_val.to_string());
+                    let size = entry_size(key.len(), val_bytes.len());
+                    
+                    if !evict_if_needed(store, size) {
+                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        return;
+                    }
+                    
+                    let existing_ttl = shard.get(key.as_ref()).and_then(|e| {
+                        e.expiry.map(|exp| if exp > now { exp - now } else { 0 })
+                    });
+                    
+                    let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
+                    
+                    if CONFIG.memory.max_memory > 0 {
+                        if let Some(old) = old_size {
+                            MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
+                        }
+                        MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+                    }
+                    
+                    writer.write_signed_integer(new_val);
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_6(cmd, b"decrby") {
+                // DECRBY key decrement
+                if command.len() >= 3 {
+                    let key = &command[1];
+                    let decrement = match parse_i64(&command[2]) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"value is not an integer or out of range");
+                            return;
+                        }
+                    };
+                    
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    let current = match shard.get(key.as_ref()) {
+                        Some(entry) => {
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    drop(entry);
+                                    shard.remove(key.as_ref());
+                                    0i64
+                                } else {
+                                    match parse_i64(&entry.value) {
+                                        Some(v) => v,
+                                        None => {
+                                            writer.write_error(b"value is not an integer or out of range");
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                match parse_i64(&entry.value) {
+                                    Some(v) => v,
+                                    None => {
+                                        writer.write_error(b"value is not an integer or out of range");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => 0i64,
+                    };
+                    
+                    let new_val = match current.checked_sub(decrement) {
+                        Some(v) => v,
+                        None => {
+                            writer.write_error(b"increment or decrement would overflow");
+                            return;
+                        }
+                    };
+                    
+                    let val_bytes = Bytes::from(new_val.to_string());
+                    let size = entry_size(key.len(), val_bytes.len());
+                    
+                    if !evict_if_needed(store, size) {
+                        writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
+                        return;
+                    }
+                    
+                    let existing_ttl = shard.get(key.as_ref()).and_then(|e| {
+                        e.expiry.map(|exp| if exp > now { exp - now } else { 0 })
+                    });
+                    
+                    let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
+                    
+                    if CONFIG.memory.max_memory > 0 {
+                        if let Some(old) = old_size {
+                            MEMORY_USED.fetch_sub(old as u64, Ordering::Relaxed);
+                        }
+                        MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+                    }
+                    
+                    writer.write_signed_integer(new_val);
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
+            if eq_ignore_case_6(cmd, b"expire") {
+                // EXPIRE key seconds
+                if command.len() >= 3 {
+                    let key = &command[1];
+                    let seconds = match parse_i64(&command[2]) {
+                        Some(v) if v > 0 => v as u64,
+                        Some(_) => {
+                            // Negative or zero TTL = delete the key
+                            let (count, bytes_freed) = store.delete(&[command[1].clone()]);
+                            if CONFIG.memory.max_memory > 0 && bytes_freed > 0 {
+                                MEMORY_USED.fetch_sub(bytes_freed as u64, Ordering::Relaxed);
+                            }
+                            writer.write_integer(count);
+                            return;
+                        }
+                        None => {
+                            writer.write_error(b"value is not an integer or out of range");
+                            return;
+                        }
+                    };
+                    
+                    let shard = &store.shards[store.hash(key)];
+                    
+                    // Check if key exists and update its expiry
+                    if let Some(mut entry) = shard.get_mut(key.as_ref()) {
+                        // Check if expired
+                        if let Some(expiry) = entry.expiry {
+                            if now >= expiry {
+                                drop(entry);
+                                shard.remove(key.as_ref());
+                                writer.write_integer(0);
+                                return;
+                            }
+                        }
+                        // Update expiry
+                        entry.expiry = Some(now + seconds);
+                        writer.write_integer(1);
+                    } else {
+                        writer.write_integer(0);
+                    }
+                } else {
+                    writer.write_error(b"wrong number of arguments");
+                }
+                return;
+            }
         }
         7 => {
             if cmd.len() == 7 {
@@ -1401,6 +2003,36 @@ fn execute_command(
                 }
                 if &lower == b"command" {
                     writer.buffer.extend_from_slice(b"*0\r\n");
+                    return;
+                }
+                if &lower == b"persist" {
+                    // PERSIST key - remove TTL from key
+                    if command.len() >= 2 {
+                        let key = &command[1];
+                        let shard = &store.shards[store.hash(key)];
+                        
+                        if let Some(mut entry) = shard.get_mut(key.as_ref()) {
+                            if let Some(expiry) = entry.expiry {
+                                if now >= expiry {
+                                    drop(entry);
+                                    shard.remove(key.as_ref());
+                                    writer.write_integer(0);
+                                } else if entry.expiry.is_some() {
+                                    entry.expiry = None;
+                                    writer.write_integer(1);
+                                } else {
+                                    writer.write_integer(0);
+                                }
+                            } else {
+                                // Key has no TTL
+                                writer.write_integer(0);
+                            }
+                        } else {
+                            writer.write_integer(0);
+                        }
+                    } else {
+                        writer.write_error(b"wrong number of arguments");
+                    }
                     return;
                 }
             }
