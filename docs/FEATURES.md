@@ -22,13 +22,32 @@
 ### Supported Commands
 
 #### Data Commands
-- `SET key value [EX seconds]` - Store with optional TTL
+- `SET key value [EX seconds | PX milliseconds] [NX | XX] [GET]` - Store with options
+  - `EX seconds` - Set expiry in seconds
+  - `PX milliseconds` - Set expiry in milliseconds
+  - `NX` - Only set if key does **not** exist (distributed locks)
+  - `XX` - Only set if key **does** exist (update only)
+  - `GET` - Return the old value before setting
 - `GET key` - Retrieve value
 - `DEL key [key ...]` - Delete one or more keys
 - `EXISTS key [key ...]` - Check key existence
+- `MSET key value [key value ...]` - Set multiple keys atomically
+- `MGET key [key ...]` - Get multiple keys in one call
 - `KEYS` - List all keys (use with caution in production)
 - `DBSIZE` - Get total key count
 - `FLUSHDB` - Clear all keys
+
+#### Counter Commands
+- `INCR key` - Increment integer value by 1 (creates key with value 1 if not exists)
+- `DECR key` - Decrement integer value by 1 (creates key with value -1 if not exists)
+- `INCRBY key increment` - Increment integer value by specified amount
+- `DECRBY key decrement` - Decrement integer value by specified amount
+
+#### TTL Commands
+- `EXPIRE key seconds` - Set timeout on existing key
+- `TTL key` - Get remaining time to live in seconds (-1 = no TTL, -2 = key doesn't exist)
+- `PTTL key` - Get remaining time to live in milliseconds
+- `PERSIST key` - Remove the timeout from a key (make it permanent)
 
 #### Server Commands
 - `PING` - Health check
@@ -172,19 +191,22 @@ The following Redis features are intentionally not implemented:
 Potential additions based on user feedback:
 
 ### High Priority
-- Additional string commands (INCR, DECR, APPEND)
-- EXPIRE/TTL commands (separate from SET EX)
-- Key scanning (SCAN for safer iteration)
+- Key scanning (`SCAN` for safer iteration than KEYS)
+- `APPEND key value` - Append to string
+- `STRLEN key` - Get string length
+- `INCRBYFLOAT key increment` - Float counter support
 
 ### Medium Priority
 - Basic list operations (LPUSH, RPUSH, LPOP, RPOP, LRANGE)
 - Basic set operations (SADD, SMEMBERS, SREM)
 - CLIENT command (list/kill connections)
+- Pub/Sub (PUBLISH, SUBSCRIBE)
 
 ### Low Priority
+- Clustering support (hash slots, node discovery)
 - Optional persistence mode (behind feature flag)
 - Replication support
-- Basic hash operations
+- Basic hash operations (HSET, HGET, HGETALL)
 
 **Note**: New features will only be added if they don't compromise core performance objectives.
 
@@ -226,9 +248,13 @@ Potential additions based on user feedback:
 | Feature | Redistill | Redis |
 |---------|-----------|-------|
 | Protocol | RESP | RESP |
-| Throughput | 2.1M ops/s | 1.0M ops/s |
-| Latency | 0.20ms | 0.37ms |
-| Data types | String only | String, List, Set, Hash, etc. |
+| Throughput | 9.07M ops/s | 2.03M ops/s |
+| Latency (p50) | 0.48ms | 2.38ms |
+| Data types | String + Counters | String, List, Set, Hash, etc. |
+| Counter commands | INCR, DECR, INCRBY, DECRBY | Full set |
+| TTL commands | EXPIRE, TTL, PTTL, PERSIST | Full set |
+| Bulk operations | MGET, MSET | Full set |
+| Conditional SET | NX, XX, GET options | Full set |
 | Persistence | None | AOF, RDB |
 | Replication | None | Master-replica |
 | Clustering | None | Redis Cluster |

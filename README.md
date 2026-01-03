@@ -300,13 +300,30 @@ buffer_pool_size = 2048
 
 ## Supported Commands
 
-Core caching commands:
-- `SET key value [EX seconds]` - Store with optional TTL
+**Data Commands:**
+- `SET key value [EX seconds | PX ms] [NX | XX] [GET]` - Store with options
 - `GET key` - Retrieve value
 - `DEL key [key ...]` - Delete keys
-- `EXISTS key` - Check existence
+- `EXISTS key [key ...]` - Check existence
+- `MSET key value [key value ...]` - Set multiple keys
+- `MGET key [key ...]` - Get multiple keys
+
+**Counter Commands:**
+- `INCR key` - Increment by 1
+- `DECR key` - Decrement by 1
+- `INCRBY key n` - Increment by n
+- `DECRBY key n` - Decrement by n
+
+**TTL Commands:**
+- `EXPIRE key seconds` - Set TTL on existing key
+- `TTL key` - Get remaining TTL (seconds)
+- `PTTL key` - Get remaining TTL (milliseconds)
+- `PERSIST key` - Remove TTL from key
+
+**Server Commands:**
 - `PING` - Health check
 - `INFO` - Server statistics
+- `DBSIZE` - Key count
 - `FLUSHDB` - Clear all data
 - `AUTH password` - Authenticate
 
