@@ -26,7 +26,7 @@ Redistill is:
 - **9.07M operations/second** - 4.5x faster than Redis, 1.7x faster than Dragonfly
 - **5x lower latency** (p50: 0.48ms vs Redis 2.38ms)
 - Multi-threaded architecture with lock-free reads
-- Zero persistence overhead
+- **Optional persistence** - Snapshot support for warm restarts (disabled by default for max performance)
 - Production-ready security and monitoring features
 
 ## Why Redistill?
@@ -37,7 +37,8 @@ Redistill is:
 - **Cost Efficient** - 50-83% infrastructure savings (fewer instances needed)  
 - **Drop-in Compatible** - Works with existing Redis clients  
 - **Production Ready** - TLS, authentication, monitoring, health checks  
-- **Multi-threaded** - Utilizes all CPU cores efficiently  
+- **Multi-threaded** - Utilizes all CPU cores efficiently
+- **Optional Persistence** - Snapshot support for warm restarts when needed (disabled by default)  
 
 ## Setting performance standard
 
@@ -165,8 +166,8 @@ Redistill is a high-performance key-value database perfect for applications requ
 
 ### Not Recommended For
 
-- **Persistent data storage** (no disk persistence)
-- **Financial or transactional data** (data lost on restart)
+- **Critical persistent data** (optional snapshots available, but not real-time durability)
+- **Financial or transactional data** (use ACID-compliant database)
 - **Data that cannot be regenerated** (use a database)
 
 > For code examples and patterns, see [Practical Examples](docs/EXAMPLES.md).
@@ -320,11 +321,16 @@ buffer_pool_size = 2048
 - `PTTL key` - Get remaining TTL (milliseconds)
 - `PERSIST key` - Remove TTL from key
 
+**Persistence Commands:** (when enabled)
+- `SAVE` - Synchronous snapshot
+- `BGSAVE` - Background snapshot
+- `LASTSAVE` - Last save timestamp
+
 **Server Commands:**
 - `PING` - Health check
 - `INFO` - Server statistics
 - `DBSIZE` - Key count
-- `FLUSHDB` - Clear all data
+- `FLUSHDB` / `FLUSHALL` - Clear all data
 - `AUTH password` - Authenticate
 
 > 📖 See [Features Documentation](docs/FEATURES.md) for complete command list.
@@ -340,6 +346,15 @@ buffer_pool_size = 2048
 - Memory limits with automatic eviction (LRU, Random, No-eviction)
 - Graceful shutdown with connection draining
 - Health check HTTP endpoint
+- **Optional persistence** - Snapshot support for warm restarts (disabled by default)
+
+**Persistence (Optional):**
+- Snapshot-based persistence for warm restarts
+- Background snapshots (non-blocking)
+- Automatic snapshot loading on startup
+- Configurable snapshot interval (default: 5 minutes)
+- Save on graceful shutdown
+- Zero performance impact when disabled (default)
 
 **Monitoring:**
 - INFO command with server statistics
@@ -404,7 +419,7 @@ redis-cli INFO memory
 A: Yes. Redistill includes authentication, TLS, memory limits, connection limits, and health checks.
 
 **Q: Can I migrate from Redis?**  
-A: Yes, for caching workloads. Redistill implements the Redis protocol but does not support persistence. Review the [Features](docs/FEATURES.md) document for command compatibility.
+A: Yes, for caching workloads. Redistill implements the Redis protocol and supports optional snapshot persistence for warm restarts. Review the [Features](docs/FEATURES.md) document for command compatibility.
 
 **Q: How do I handle high availability?**  
 A: Use client-side sharding or a proxy like Twemproxy. Clustering support is on the roadmap.
@@ -413,7 +428,7 @@ A: Use client-side sharding or a proxy like Twemproxy. Clustering support is on 
 A: Configure `max_memory` and `eviction_policy` in the configuration. Redistill automatically evicts keys when the limit is reached.
 
 **Q: When should I use Redis instead?**  
-A: Use Redis if you need persistence (AOF/RDB), replication, clustering, or complex data types (lists, sets, hashes). Use Redistill for maximum cache performance.
+A: Use Redis if you need real-time durability (AOF), replication, clustering, or complex data types (lists, sets, hashes). Use Redistill for maximum cache performance with optional snapshot persistence for warm restarts.
 
 **Q: Is it stable?**  
 A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and production workloads. All core functionality is stable.
@@ -427,7 +442,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | Throughput (clustered) | Manual sharding | Scales horizontally | Redis Cluster scales horizontally |
 | Latency (p50) | **0.48ms** | 0.81ms | 2.38ms |
 | Concurrency model | Multi-threaded | Multi-threaded | Single-threaded |
-| Persistence | No | Yes | Yes (AOF/RDB) |
+| Persistence | Optional (snapshots) | Yes (AOF/RDB) | Yes (AOF/RDB) |
 | Replication | No | Yes | Yes |
 | Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
 | Data types | String (KV) | Full Redis | Full Redis |
@@ -444,8 +459,8 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 - Maximum throughput and minimum latency
 
 **When to Use Redis/Dragonfly:**
-- Need persistence (data must survive restarts)
-- Need replication and clustering
+- Need real-time durability (AOF) or replication
+- Need clustering
 - Complex data structures required
 - Established ecosystem and tooling critical
 

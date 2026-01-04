@@ -140,15 +140,43 @@
 - HTTP health endpoint (JSON)
 - Real-time statistics
 
+### Persistence (Optional)
+
+Redistill supports **optional snapshot persistence** for warm restarts. Disabled by default for maximum performance.
+
+**Commands:**
+- `SAVE` - Synchronous snapshot (blocks until complete)
+- `BGSAVE` - Background snapshot (returns immediately)
+- `LASTSAVE` - Unix timestamp of last successful save
+- `FLUSHALL` - Clear all keys
+
+**Configuration:**
+```toml
+[persistence]
+enabled = false                   # Enable persistence (default: false)
+snapshot_path = "redistill.rdb"   # Snapshot file path
+snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled)
+save_on_shutdown = true           # Save on graceful shutdown
+```
+
+**Features:**
+- Streaming serialization
+- Atomic file writes
+- Automatic snapshot loading on startup
+- Background saves don't block request handling
+- Skips expired keys during save/load
+
+**Note:** This is snapshot-only persistence (RDB-like). No AOF/write-ahead logging. Data loss possible between snapshots.
+
 ## Not Implemented
 
 The following Redis features are intentionally not implemented:
 
-### Persistence
+### Write-Ahead Logging (AOF)
 
-**Excluded**: AOF, RDB, BGSAVE, SAVE commands
+**Excluded**: AOF append-only file, fsync modes
 
-**Rationale**: Redistill is optimized for pure in-memory operation. Persistence adds disk I/O overhead, reducing throughput. For persistent storage, use Redis or a database.
+**Rationale**: AOF adds write latency. Snapshot persistence is sufficient for warm restarts.
 
 ### Replication
 

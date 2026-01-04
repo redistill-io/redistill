@@ -13,11 +13,11 @@ This document explains the design decisions, architecture, and trade-offs that m
 
 ## Design Philosophy
 
-Redistill is built on a simple principle: **trade persistence for performance**. By eliminating the persistence layer entirely, Redistill can optimize for what matters most in a caching layer: speed, throughput, and low latency.
+Redistill is built on a simple principle: **performance first, optional persistence**. By default, Redistill eliminates persistence overhead to maximize speed, throughput, and low latency. For users who need storage, optional snapshot persistence is available without impacting the hot path.
 
 ### Core Principles
 
-1. **No Persistence** - Zero disk I/O overhead
+1. **Optional Persistence** - Zero disk I/O overhead by default; snapshot support available when needed
 2. **Multi-threaded** - Leverage all CPU cores
 3. **Lock-free Reads** - Concurrent access without blocking
 4. **Zero-copy** - Minimize memory allocations
@@ -29,22 +29,27 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 ## Performance Optimizations
 
-### 1. No Persistence Layer
+### 1. Optional Persistence Layer
 
 **What Redis Does:**
 - Writes to AOF (Append-Only File) on every write
 - Periodic RDB snapshots
 - fsync() calls for durability
 
-**What Redistill Does:**
-- Nothing. All data lives in memory only.
+**What Redistill Does (Default):**
+- No persistence by default. All data lives in memory only.
+- Zero disk I/O overhead on the hot path
+
+**What Redistill Does (Optional):**
+- Snapshot-based persistence (disabled by default)
+- Background snapshots don't block request handling
+- Streaming serialization
+- Automatic snapshot loading on startup
 
 **Impact:**
-- Eliminates all disk I/O
-- No AOF rewriting overhead
-- No fsync() blocking
-- Simpler code path for writes
-- Data lost on restart (by design)
+- **Default (disabled)**: Eliminates all disk I/O, no fsync() blocking, simpler code path
+- **Optional (enabled)**: Warm restarts supported, zero impact on GET/SET performance, background saves only
+- Data loss possible between snapshots (by design - not real-time durability)
 
 ### 2. Multi-threaded Architecture
 
@@ -140,6 +145,36 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 - Better error handling
 - Future-proof (Tokio improvements benefit Redistill)
 
+### 7. Optional Snapshot Persistence
+
+**What Redis Does:**
+- AOF (Append-Only File) with fsync() calls
+- RDB snapshots with fork() overhead
+- Both enabled by default
+
+**What Redistill Does:**
+- **Default**: No persistence (zero overhead)
+- **Optional**: Snapshot-based persistence (disabled by default)
+  - Streaming serialization (constant memory)
+  - Background saves (non-blocking)
+  - Atomic file writes (temp file + rename)
+  - Automatic loading on startup
+
+**Impact:**
+- **When disabled (default)**: Zero disk I/O, maximum performance
+- **When enabled**: Warm restarts supported, zero impact on GET/SET hot path
+- Background snapshots run in separate task, don't block requests
+- Snapshot format: Binary (bincode) for fast serialization
+
+**Configuration:**
+```toml
+[persistence]
+enabled = false              # Default: OFF for max performance
+snapshot_path = "redistill.rdb"
+snapshot_interval = 300      # Auto-save every 5 minutes (0 = disabled)
+save_on_shutdown = true      # Save on graceful shutdown
+```
+
 ## Trade-offs
 
 ### What You Gain
@@ -162,7 +197,8 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 | Feature | Impact | Mitigation |
 |---------|--------|-----------|
-| **Persistence** | Data lost on restart | Use as cache, not source of truth |
+| **Persistence (default)** | Data lost on restart | Optional snapshot persistence available; use as cache, not source of truth |
+| **Real-time Durability** | No AOF/write-ahead logging | Snapshot persistence for warm restarts (optional) |
 | **Replication** | No built-in HA | Use client-side sharding/proxy |
 | **Clustering** | No automatic sharding | Manual sharding or proxy |
 | **Complex data types** | Only strings | Fine for 90% of cache use cases |
@@ -188,9 +224,9 @@ Redistill is built on a simple principle: **trade persistence for performance**.
 
 ### When Redis is Better
 
-**Need persistence**
-- Redis has AOF/RDB
-- Redistill loses data on restart
+**Need real-time durability**
+- Redis has AOF (write-ahead logging) for real-time durability
+- Redistill has optional snapshots (warm restarts) but not real-time durability
 
 **Need replication/clustering**
 - Redis has built-in clustering (can scale to higher total throughput with multiple instances)
@@ -343,7 +379,7 @@ Total size: key_len + value_len + 64 bytes
 
 - [ ] **Clustering support** - Built-in sharding
 - [ ] **Replication** - Master-slave replication
-- [ ] **Snapshot support** - Optional persistence
+- [x] **Snapshot support** - Optional persistence (✅ Implemented)
 - [ ] **Pub/Sub** - Message broadcasting
 - [ ] **Lua scripting** - Custom commands
 - [ ] **More data types** - Lists, Sets, Hashes
