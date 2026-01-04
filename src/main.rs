@@ -115,6 +115,37 @@ impl Default for MemoryConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistenceConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_snapshot_path")]
+    snapshot_path: String,
+    #[serde(default = "default_true")]
+    save_on_shutdown: bool,
+    #[serde(default = "default_snapshot_interval")]
+    snapshot_interval: u64, // seconds, 0 = disabled
+}
+
+fn default_snapshot_path() -> String {
+    "redistill.rdb".to_string()
+}
+
+fn default_snapshot_interval() -> u64 {
+    300 // 5 minutes
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            snapshot_path: default_snapshot_path(),
+            save_on_shutdown: true,
+            snapshot_interval: default_snapshot_interval(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EvictionPolicy {
     NoEviction,
@@ -153,6 +184,8 @@ struct Config {
     performance: PerformanceConfig,
     #[serde(default)]
     memory: MemoryConfig,
+    #[serde(default)]
+    persistence: PersistenceConfig,
 }
 
 // Default functions
@@ -247,6 +280,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             performance: PerformanceConfig::default(),
             memory: MemoryConfig::default(),
+            persistence: PersistenceConfig::default(),
         }
     }
 }
@@ -263,7 +297,7 @@ impl Config {
         } else {
             if config_path != "redistill.toml" {
                 eprintln!(
-                    "⚠️  Config file '{}' not found, using defaults",
+                    "Config file '{}' not found, using defaults",
                     config_path
                 );
             }
@@ -344,6 +378,25 @@ impl Config {
             }
         }
 
+        // Persistence settings via environment variables
+        if let Ok(enabled) = std::env::var("REDIS_PERSISTENCE_ENABLED") {
+            config.persistence.enabled = enabled.parse().unwrap_or(false);
+        }
+
+        if let Ok(path) = std::env::var("REDIS_SNAPSHOT_PATH") {
+            config.persistence.snapshot_path = path;
+        }
+
+        if let Ok(interval) = std::env::var("REDIS_SNAPSHOT_INTERVAL") {
+            if let Ok(i) = interval.parse() {
+                config.persistence.snapshot_interval = i;
+            }
+        }
+
+        if let Ok(save_on_shutdown) = std::env::var("REDIS_SAVE_ON_SHUTDOWN") {
+            config.persistence.save_on_shutdown = save_on_shutdown.parse().unwrap_or(true);
+        }
+
         // Validate configuration
         config.validate()?;
 
@@ -408,6 +461,10 @@ static LAST_CONNECTION_CHECK: AtomicU64 = AtomicU64::new(0);
 static CONNECTIONS_THIS_SECOND: AtomicU64 = AtomicU64::new(0);
 static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static START_TIME: Lazy<SystemTime> = Lazy::new(SystemTime::now);
+
+// Persistence state
+static LAST_SAVE_TIME: AtomicU64 = AtomicU64::new(0);
+static SAVE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Buffer pool for zero-allocation response writing
 static BUFFER_POOL: Lazy<SegQueue<Vec<u8>>> = Lazy::new(|| {
@@ -1186,6 +1243,246 @@ async fn expiration_task(store: ShardedStore) {
     }
 }
 
+// ==================== Persistence / Snapshot ====================
+
+// Snapshot file format:
+// - Magic: "RDST" (4 bytes)
+// - Version: u8
+// - Timestamp: u64
+// - Entry count: u64
+// - Entries: [key_len: u32, key: bytes, value_len: u32, value: bytes, expiry: Option<u64>]...
+const SNAPSHOT_MAGIC: &[u8; 4] = b"RDST";
+const SNAPSHOT_VERSION: u8 = 1;
+
+// Entry structure for serialization (avoid atomic types)
+#[derive(Serialize, Deserialize)]
+struct SnapshotEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    expiry: Option<u64>,
+}
+
+/// Save snapshot synchronously (blocking) - used by SAVE command
+fn save_snapshot_sync(store: &ShardedStore, path: &str) -> Result<usize, String> {
+    use std::io::{BufWriter, Write};
+    
+    // Prevent concurrent saves
+    if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return Err("Background save already in progress".to_string());
+    }
+    
+    let result = (|| {
+        let now = get_timestamp();
+        let temp_path = format!("{}.tmp", path);
+        
+        // Create file with buffered writer for streaming
+        let file = std::fs::File::create(&temp_path)
+            .map_err(|e| format!("Failed to create snapshot file: {}", e))?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
+        
+        // Write header
+        writer.write_all(SNAPSHOT_MAGIC)
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+        writer.write_all(&[SNAPSHOT_VERSION])
+            .map_err(|e| format!("Failed to write version: {}", e))?;
+        writer.write_all(&now.to_le_bytes())
+            .map_err(|e| format!("Failed to write timestamp: {}", e))?;
+        
+        // Count entries (approximate, may change during iteration)
+        let entry_count_pos = writer.stream_position()
+            .map_err(|e| format!("Failed to get position: {}", e))?;
+        writer.write_all(&0u64.to_le_bytes()) // Placeholder
+            .map_err(|e| format!("Failed to write entry count: {}", e))?;
+        
+        // Stream entries from all shards
+        let mut count: u64 = 0;
+        for shard in &store.shards {
+            for entry in shard.iter() {
+                let (key, val) = entry.pair();
+                
+                // Skip expired entries
+                if let Some(expiry) = val.expiry {
+                    if now >= expiry {
+                        continue;
+                    }
+                }
+                
+                // Serialize entry using bincode
+                let snapshot_entry = SnapshotEntry {
+                    key: key.to_vec(),
+                    value: val.value.to_vec(),
+                    expiry: val.expiry,
+                };
+                
+                let encoded = bincode::serialize(&snapshot_entry)
+                    .map_err(|e| format!("Failed to serialize entry: {}", e))?;
+                
+                // Write length-prefixed entry
+                writer.write_all(&(encoded.len() as u32).to_le_bytes())
+                    .map_err(|e| format!("Failed to write entry length: {}", e))?;
+                writer.write_all(&encoded)
+                    .map_err(|e| format!("Failed to write entry: {}", e))?;
+                
+                count += 1;
+            }
+        }
+        
+        // Flush and get file handle back
+        writer.flush().map_err(|e| format!("Failed to flush: {}", e))?;
+        let mut file = writer.into_inner()
+            .map_err(|e| format!("Failed to get file: {}", e))?;
+        
+        // Go back and write actual entry count
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(entry_count_pos))
+            .map_err(|e| format!("Failed to seek: {}", e))?;
+        file.write_all(&count.to_le_bytes())
+            .map_err(|e| format!("Failed to write final count: {}", e))?;
+        
+        // Sync to disk
+        file.sync_all().map_err(|e| format!("Failed to sync: {}", e))?;
+        drop(file);
+        
+        // Atomic rename
+        std::fs::rename(&temp_path, path)
+            .map_err(|e| format!("Failed to rename snapshot: {}", e))?;
+        
+        // Update last save time
+        LAST_SAVE_TIME.store(now, Ordering::Relaxed);
+        
+        Ok(count as usize)
+    })();
+    
+    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Load snapshot from disk - called on startup
+fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> {
+    use std::io::{BufReader, Read};
+    
+    if !std::path::Path::new(path).exists() {
+        return Ok(0); // No snapshot to load
+    }
+    
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open snapshot: {}", e))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    
+    // Read and verify header
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)
+        .map_err(|e| format!("Failed to read magic: {}", e))?;
+    if &magic != SNAPSHOT_MAGIC {
+        return Err("Invalid snapshot file (bad magic)".to_string());
+    }
+    
+    let mut version = [0u8; 1];
+    reader.read_exact(&mut version)
+        .map_err(|e| format!("Failed to read version: {}", e))?;
+    if version[0] != SNAPSHOT_VERSION {
+        return Err(format!("Unsupported snapshot version: {}", version[0]));
+    }
+    
+    let mut timestamp_bytes = [0u8; 8];
+    reader.read_exact(&mut timestamp_bytes)
+        .map_err(|e| format!("Failed to read timestamp: {}", e))?;
+    let _snapshot_time = u64::from_le_bytes(timestamp_bytes);
+    
+    let mut count_bytes = [0u8; 8];
+    reader.read_exact(&mut count_bytes)
+        .map_err(|e| format!("Failed to read entry count: {}", e))?;
+    let entry_count = u64::from_le_bytes(count_bytes);
+    
+    let now = get_timestamp();
+    let mut loaded: usize = 0;
+    let mut skipped_expired: usize = 0;
+    
+    // Read entries
+    for _ in 0..entry_count {
+        // Read entry length
+        let mut len_bytes = [0u8; 4];
+        if reader.read_exact(&mut len_bytes).is_err() {
+            break; // End of file
+        }
+        let entry_len = u32::from_le_bytes(len_bytes) as usize;
+        
+        // Read entry data
+        let mut entry_data = vec![0u8; entry_len];
+        reader.read_exact(&mut entry_data)
+            .map_err(|e| format!("Failed to read entry data: {}", e))?;
+        
+        // Deserialize
+        let snapshot_entry: SnapshotEntry = bincode::deserialize(&entry_data)
+            .map_err(|e| format!("Failed to deserialize entry: {}", e))?;
+        
+        // Skip expired entries
+        if let Some(expiry) = snapshot_entry.expiry {
+            if now >= expiry {
+                skipped_expired += 1;
+                continue;
+            }
+        }
+        
+        // Calculate remaining TTL
+        let ttl = snapshot_entry.expiry.and_then(|exp| {
+            if exp > now { Some(exp - now) } else { None }
+        });
+        
+        // Insert into store
+        let key = Bytes::from(snapshot_entry.key);
+        let value = Bytes::from(snapshot_entry.value);
+        
+        // Track memory if needed
+        if CONFIG.memory.max_memory > 0 {
+            let size = entry_size(key.len(), value.len());
+            MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
+        }
+        
+        store.set(key, value, ttl, now);
+        loaded += 1;
+    }
+    
+    // Update last save time to snapshot time
+    LAST_SAVE_TIME.store(now, Ordering::Relaxed);
+    
+    if skipped_expired > 0 {
+        eprintln!("   Skipped {} expired keys", skipped_expired);
+    }
+    
+    Ok(loaded)
+}
+
+/// Background task for periodic snapshots
+async fn snapshot_task(store: ShardedStore, interval_secs: u64, path: String) {
+    if interval_secs == 0 {
+        return; // Disabled
+    }
+    
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    interval.tick().await; // Skip first immediate tick
+    
+    loop {
+        interval.tick().await;
+        
+        // Clone store reference for background save
+        let store_clone = store.clone();
+        let path_clone = path.clone();
+        
+        // Spawn blocking task for I/O
+        tokio::task::spawn_blocking(move || {
+            match save_snapshot_sync(&store_clone, &path_clone) {
+                Ok(count) => {
+                    eprintln!("Background snapshot saved: {} keys to {}", count, path_clone);
+                }
+                Err(e) => {
+                    eprintln!("Background snapshot failed: {}", e);
+                }
+            }
+        });
+    }
+}
+
 // Execute command - fully inlined and optimized
 #[inline(always)]
 fn execute_command(
@@ -1442,6 +1739,23 @@ fn execute_command(
             if eq_ignore_case_3(&cmd[..3], b"key") && (cmd[3] | 0x20) == b's' {
                 let keys = store.keys(now);
                 writer.write_array(&keys);
+                return;
+            }
+            if eq_ignore_case_3(&cmd[..3], b"sav") && (cmd[3] | 0x20) == b'e' {
+                // SAVE - synchronous snapshot (blocks until complete)
+                if !CONFIG.persistence.enabled {
+                    writer.write_error(b"persistence is disabled");
+                    return;
+                }
+                match save_snapshot_sync(store, &CONFIG.persistence.snapshot_path) {
+                    Ok(count) => {
+                        eprintln!("Snapshot saved: {} keys", count);
+                        writer.write_simple_string(b"OK");
+                    }
+                    Err(e) => {
+                        writer.write_error(e.as_bytes());
+                    }
+                }
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"inc") && (cmd[3] | 0x20) == b'r' {
@@ -1773,6 +2087,36 @@ fn execute_command(
                 }
                 return;
             }
+            if eq_ignore_case_6(cmd, b"bgsave") {
+                // BGSAVE - background snapshot (returns immediately)
+                if !CONFIG.persistence.enabled {
+                    writer.write_error(b"persistence is disabled");
+                    return;
+                }
+                if SAVE_IN_PROGRESS.load(Ordering::Relaxed) {
+                    writer.write_error(b"Background save already in progress");
+                    return;
+                }
+                
+                // Clone store for background task
+                let store_clone = store.clone();
+                let path = CONFIG.persistence.snapshot_path.clone();
+                
+                // Spawn background save
+                std::thread::spawn(move || {
+                    match save_snapshot_sync(&store_clone, &path) {
+                        Ok(count) => {
+                            eprintln!("Background snapshot saved: {} keys", count);
+                        }
+                        Err(e) => {
+                            eprintln!("Background snapshot failed: {}", e);
+                        }
+                    }
+                });
+                
+                writer.write_simple_string(b"Background saving started");
+                return;
+            }
             if eq_ignore_case_6(cmd, b"dbsize") {
                 let size = store.len();
                 writer.write_integer(size);
@@ -2037,6 +2381,32 @@ fn execute_command(
                 }
             }
         }
+        8 => {
+            // LASTSAVE - return timestamp of last successful save
+            if cmd.len() == 8 {
+                let lower = [
+                    cmd[0] | 0x20,
+                    cmd[1] | 0x20,
+                    cmd[2] | 0x20,
+                    cmd[3] | 0x20,
+                    cmd[4] | 0x20,
+                    cmd[5] | 0x20,
+                    cmd[6] | 0x20,
+                    cmd[7] | 0x20,
+                ];
+                if &lower == b"lastsave" {
+                    let last_save = LAST_SAVE_TIME.load(Ordering::Relaxed);
+                    writer.write_integer(last_save as usize);
+                    return;
+                }
+                if &lower == b"flushall" {
+                    store.clear();
+                    MEMORY_USED.store(0, Ordering::Relaxed);
+                    writer.write_simple_string(b"OK");
+                    return;
+                }
+            }
+        }
         _ => {}
     }
 
@@ -2234,14 +2604,14 @@ async fn start_health_check_server(port: u16) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
-                "⚠️  Failed to bind health check endpoint on {}: {}",
+                "Failed to bind health check endpoint on {}: {}",
                 addr, e
             );
             return;
         }
     };
 
-    println!("🏥 Health check endpoint: http://{}/health", addr);
+    println!("Health check endpoint: http://{}/health", addr);
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -2282,7 +2652,7 @@ async fn main() {
 |__/  |__/ \_______/ \_______/|__/|_______/    \___/  |__/|__/|__/
                                                                   
 ══════════════════════════════════════════════════════════════════
-📊 Configuration:
+Configuration:
    • Bind Address: {}:{}
    • Shards: {}
    • CPU Cores: {}
@@ -2294,8 +2664,9 @@ async fn main() {
    • TCP NoDelay: {}
    • Max Memory: {}
    • Eviction Policy: {}
+   • Persistence: {}
 
-🎯 Performance: 2x faster than Redis with pipelining!
+Performance: 2x faster than Redis with pipelining!
 "#,
         config.server.bind,
         config.server.port,
@@ -2324,13 +2695,33 @@ async fn main() {
         } else {
             "unlimited".to_string()
         },
-        config.memory.eviction_policy
+        config.memory.eviction_policy,
+        if config.persistence.enabled {
+            format!("enabled (interval: {}s, path: {})", 
+                config.persistence.snapshot_interval,
+                config.persistence.snapshot_path)
+        } else {
+            "disabled".to_string()
+        }
     );
+
+    // Load snapshot if persistence is enabled
+    if config.persistence.enabled {
+        print!("Loading snapshot from {}... ", config.persistence.snapshot_path);
+        match load_snapshot(&store, &config.persistence.snapshot_path) {
+            Ok(0) => println!("no snapshot found"),
+            Ok(count) => println!("loaded {} keys", count),
+            Err(e) => {
+                eprintln!("failed: {}", e);
+                eprintln!("Starting with empty database");
+            }
+        }
+    }
 
     // Load TLS configuration if enabled
     let tls_acceptor = if config.security.tls_enabled {
         if config.security.tls_cert_path.is_empty() || config.security.tls_key_path.is_empty() {
-            eprintln!("❌ TLS enabled but cert/key paths not configured");
+            eprintln!("TLS enabled but cert/key paths not configured");
             std::process::exit(1);
         }
 
@@ -2341,14 +2732,14 @@ async fn main() {
         .await
         {
             Ok(tls_config) => {
-                println!("🔐 TLS/SSL enabled");
+                println!("TLS/SSL enabled");
                 println!("   • Certificate: {}", config.security.tls_cert_path);
                 println!("   • Private Key: {}", config.security.tls_key_path);
                 Some(TlsAcceptor::from(tls_config))
             }
             Err(e) => {
-                eprintln!("❌ Failed to load TLS configuration: {}", e);
-                eprintln!("   Make sure certificate and key files exist and are valid");
+                eprintln!("Failed to load TLS configuration: {}", e);
+                eprintln!("Make sure certificate and key files exist and are valid");
                 std::process::exit(1);
             }
         }
@@ -2358,26 +2749,26 @@ async fn main() {
 
     let bind_addr = format!("{}:{}", config.server.bind, config.server.port);
     let listener = TcpListener::bind(&bind_addr).await.unwrap_or_else(|e| {
-        eprintln!("❌ Failed to bind to {}: {}", bind_addr, e);
+        eprintln!("Failed to bind to {}: {}", bind_addr, e);
         std::process::exit(1);
     });
 
-    println!("🎧 Listening on {}", bind_addr);
+    println!("Listening on {}", bind_addr);
 
     if !config.security.password.is_empty() {
-        println!("🔒 Authentication enabled (password set in config or env var)");
+        println!("Authentication enabled (password set in config or env var)");
     } else {
         println!(
-            "⚠️  Authentication disabled (set password in config file or REDIS_PASSWORD env var)"
+            "Authentication disabled (set password in config file or REDIS_PASSWORD env var)"
         );
     }
 
     let config_file =
         std::env::var("REDISTILL_CONFIG").unwrap_or_else(|_| "redistill.toml".to_string());
     if std::path::Path::new(&config_file).exists() {
-        println!("📄 Configuration loaded from {}", config_file);
+        println!("Configuration loaded from {}", config_file);
     } else {
-        println!("📄 Using default configuration (create redistill.toml to customize)");
+        println!("Using default configuration (create redistill.toml to customize)");
     }
 
     // Start health check endpoint if enabled
@@ -2393,6 +2784,17 @@ async fn main() {
     tokio::spawn(async move {
         expiration_task(expiration_store).await;
     });
+
+    // Start periodic snapshot background task if enabled
+    if config.persistence.enabled && config.persistence.snapshot_interval > 0 {
+        let snapshot_store = store.clone();
+        let interval = config.persistence.snapshot_interval;
+        let path = config.persistence.snapshot_path.clone();
+        println!("Periodic snapshots enabled: every {} seconds to {}", interval, path);
+        tokio::spawn(async move {
+            snapshot_task(snapshot_store, interval, path).await;
+        });
+    }
 
     println!();
 
@@ -2442,13 +2844,26 @@ async fn main() {
                 }
             }
             _ = signal::ctrl_c() => {
-                println!("\n\n🛑 Received shutdown signal...");
-                println!("📊 Final Stats:");
+                println!("\n\nReceived shutdown signal...");
+                
+                // Save snapshot on shutdown if enabled
+                if CONFIG.persistence.enabled && CONFIG.persistence.save_on_shutdown {
+                    print!("Saving final snapshot... ");
+                    match save_snapshot_sync(&store, &CONFIG.persistence.snapshot_path) {
+                        Ok(count) => println!("saved {} keys", count),
+                        Err(e) => eprintln!("failed: {}", e),
+                    }
+                }
+                
+                println!("Final Stats:");
                 println!("   • Total connections: {}", TOTAL_CONNECTIONS.load(Ordering::Relaxed));
                 println!("   • Total commands: {}", TOTAL_COMMANDS.load(Ordering::Relaxed));
                 println!("   • Active connections: {}", ACTIVE_CONNECTIONS.load(Ordering::Relaxed));
                 println!("   • Keys in database: {}", store.len());
-                println!("\n👋 Redistill shut down gracefully");
+                if CONFIG.persistence.enabled {
+                    println!("   • Last save: {}", LAST_SAVE_TIME.load(Ordering::Relaxed));
+                }
+                println!("\nRedistill shut down gracefully");
                 break;
             }
         }
