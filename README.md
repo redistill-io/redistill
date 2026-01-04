@@ -290,6 +290,12 @@ tcp_nodelay = true
 tcp_keepalive = 60
 batch_size = 256
 buffer_pool_size = 2048
+
+[persistence]
+enabled = false                   # Enable for warm restarts (disabled by default for max speed)
+snapshot_path = "redistill.rdb"   # Snapshot file path
+snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled)
+save_on_shutdown = true           # Save snapshot on graceful shutdown
 ```
 
 **Quick Tips:**

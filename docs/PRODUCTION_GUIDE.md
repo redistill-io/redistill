@@ -122,6 +122,30 @@ Use production certificates:
 
 **Do not** use self-signed certificates in production.
 
+### 6. Persistence Configuration (Optional)
+
+**Requirement**: Optional - Enable for warm restarts
+
+```toml
+[persistence]
+enabled = true                    # Enable snapshot persistence
+snapshot_path = "/data/redistill.rdb"  # Snapshot file path
+snapshot_interval = 300           # Auto-save every 5 minutes (0 = disabled)
+save_on_shutdown = true          # Save snapshot on graceful shutdown
+```
+
+**When to Enable:**
+- Need warm restarts after deployments
+- Can tolerate slight performance overhead
+- Want to preserve data across restarts
+
+**When to Keep Disabled:**
+- Maximum performance is critical
+- Data can be regenerated
+- Using external persistence layer
+
+**Note:** Persistence is disabled by default for maximum performance. When enabled, snapshots are saved in the background and don't block request handling.
+
 ## Deployment Methods
 
 ### Docker Deployment
@@ -378,6 +402,9 @@ max_connections = 50000
 [performance]
 tcp_nodelay = true
 tcp_keepalive = 120
+
+[persistence]
+enabled = false  # Disabled for maximum performance
 ```
 
 **Expected**: 2.5M+ ops/s with pipelining
@@ -408,6 +435,9 @@ buffer_pool_size = 512
 [memory]
 max_memory = 1073741824  # 1GB
 eviction_policy = "allkeys-lru"
+
+[persistence]
+enabled = false  # Optional: Enable if warm restarts needed
 ```
 
 ## Security Hardening
@@ -504,13 +534,33 @@ shard.set('user:12345', data)
 
 ## Backup and Recovery
 
+### Persistence Options
+
+Redistill supports **optional snapshot-based persistence** for warm restarts. By default, persistence is disabled for maximum performance.
+
+**With Persistence Disabled (Default):**
+- Maximum performance (zero disk I/O overhead)
+- All data lost on restart
+- Use as cache, not source of truth
+
+**With Persistence Enabled:**
+- Warm restarts supported (snapshots loaded on startup)
+- Background snapshots (non-blocking)
+- Configurable snapshot interval
+- Save on graceful shutdown
+- Data loss possible between snapshots (not real-time durability)
+
 ### Data Loss Scenarios
 
-Redistill has no persistence. Plan for these scenarios:
-
+**Without Persistence (Default):**
 1. **Server crash**: All data lost
 2. **Deployment**: All data lost
 3. **Restart**: All data lost
+
+**With Persistence Enabled:**
+1. **Server crash**: Data since last snapshot lost
+2. **Deployment**: Data since last snapshot lost (if snapshot saved before restart)
+3. **Restart**: Data since last snapshot lost (if snapshot saved before restart)
 
 ### Mitigation Strategies
 

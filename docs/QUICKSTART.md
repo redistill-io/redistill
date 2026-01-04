@@ -189,6 +189,12 @@ password = "your-password"
 [memory]
 max_memory = 2147483648  # 2GB
 eviction_policy = "allkeys-lru"
+
+[persistence]
+enabled = false                   # Optional: Enable for warm restarts
+snapshot_path = "redistill.rdb"   # Snapshot file path
+snapshot_interval = 300           # Auto-save interval (0 = disabled)
+save_on_shutdown = true           # Save on graceful shutdown
 ```
 
 Restart server to apply configuration.

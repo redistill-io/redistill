@@ -11,7 +11,7 @@
 
 **Storage**: In-memory key-value store
 - Fast hash-based lookups
-- Sharded architecture (256 shards default)
+- Sharded architecture (256 shards default, 2048 recommended for production)
 - Zero-copy operations
 
 **TTL Support**: Automatic key expiration

@@ -46,6 +46,12 @@ format = "text"
 [performance]
 tcp_nodelay = true
 tcp_keepalive = 60
+
+[persistence]
+enabled = false
+snapshot_path = "redistill.rdb"
+snapshot_interval = 300
+save_on_shutdown = true
 ```
 
 ## Configuration Sections
@@ -96,16 +102,39 @@ tcp_keepalive = 60
 | `tcp_nodelay` | boolean | true | Disable Nagle's algorithm (recommended for low latency) |
 | `tcp_keepalive` | integer | 60 | TCP keepalive interval in seconds (0 = disabled) |
 
+### Persistence Configuration
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | boolean | false | Enable snapshot-based persistence (disabled by default for max speed) |
+| `snapshot_path` | string | "redistill.rdb" | Path to snapshot file |
+| `snapshot_interval` | integer | 300 | Auto-save interval in seconds (0 = disabled, default: 300 = 5 min) |
+| `save_on_shutdown` | boolean | true | Save snapshot on graceful shutdown (SIGTERM/Ctrl+C) |
+
 ## Environment Variables
 
 Environment variables override configuration file settings:
 
 | Variable | Overrides | Example |
 |----------|-----------|---------|
+| `REDISTILL_CONFIG` | Config file path | `REDISTILL_CONFIG=/etc/redistill.toml` |
 | `REDIS_PASSWORD` | `security.password` | `REDIS_PASSWORD=secret` |
 | `REDIS_PORT` | `server.port` | `REDIS_PORT=6380` |
 | `REDIS_BIND` | `server.bind` | `REDIS_BIND=0.0.0.0` |
-| `REDISTILL_CONFIG` | Config file path | `REDISTILL_CONFIG=/etc/redistill.toml` |
+| `REDIS_HEALTH_CHECK_PORT` | `server.health_check_port` | `REDIS_HEALTH_CHECK_PORT=8080` |
+| `REDIS_NUM_SHARDS` | `server.num_shards` | `REDIS_NUM_SHARDS=2048` |
+| `REDIS_BATCH_SIZE` | `server.batch_size` | `REDIS_BATCH_SIZE=256` |
+| `REDIS_BUFFER_SIZE` | `server.buffer_size` | `REDIS_BUFFER_SIZE=16384` |
+| `REDIS_BUFFER_POOL_SIZE` | `server.buffer_pool_size` | `REDIS_BUFFER_POOL_SIZE=2048` |
+| `REDIS_MAX_CONNECTIONS` | `server.max_connections` | `REDIS_MAX_CONNECTIONS=10000` |
+| `REDIS_MAX_MEMORY` | `memory.max_memory` | `REDIS_MAX_MEMORY=2147483648` |
+| `REDIS_EVICTION_POLICY` | `memory.eviction_policy` | `REDIS_EVICTION_POLICY=allkeys-lru` |
+| `REDIS_TCP_NODELAY` | `performance.tcp_nodelay` | `REDIS_TCP_NODELAY=true` |
+| `REDIS_TCP_KEEPALIVE` | `performance.tcp_keepalive` | `REDIS_TCP_KEEPALIVE=60` |
+| `REDIS_PERSISTENCE_ENABLED` | `persistence.enabled` | `REDIS_PERSISTENCE_ENABLED=true` |
+| `REDIS_SNAPSHOT_PATH` | `persistence.snapshot_path` | `REDIS_SNAPSHOT_PATH=/data/redistill.rdb` |
+| `REDIS_SNAPSHOT_INTERVAL` | `persistence.snapshot_interval` | `REDIS_SNAPSHOT_INTERVAL=600` |
+| `REDIS_SAVE_ON_SHUTDOWN` | `persistence.save_on_shutdown` | `REDIS_SAVE_ON_SHUTDOWN=true` |
 
 ## Example Configurations
 
@@ -134,6 +163,12 @@ eviction_policy = "allkeys-lru"
 [performance]
 tcp_nodelay = true
 tcp_keepalive = 120
+
+[persistence]
+enabled = true
+snapshot_path = "/data/redistill.rdb"
+snapshot_interval = 300
+save_on_shutdown = true
 ```
 
 ### Development Local
@@ -203,6 +238,50 @@ tcp_nodelay = true  # Critical for low latency
 - Protects against connection floods
 - Set to 10x normal connection rate
 - Monitor `rejected_connections` for tuning
+
+## Persistence
+
+### Snapshot-Based Persistence
+
+Redistill supports optional snapshot-based persistence for warm restarts. When enabled, snapshots are saved to disk periodically and on graceful shutdown.
+
+**Key Features:**
+- **Zero performance impact when disabled** (default)
+- Background snapshots (non-blocking)
+- Automatic snapshot loading on startup
+- Configurable snapshot interval
+- Save on graceful shutdown
+
+**When to Enable:**
+- Need warm restarts after server restarts
+- Can tolerate slight performance overhead
+- Want to preserve data across deployments
+
+**When to Keep Disabled:**
+- Maximum performance is critical
+- Data can be regenerated
+- Using external persistence layer
+
+### Snapshot Configuration
+
+```toml
+[persistence]
+enabled = true                    # Enable persistence
+snapshot_path = "redistill.rdb"   # Snapshot file path
+snapshot_interval = 300           # Auto-save every 5 minutes (0 = disabled)
+save_on_shutdown = true           # Save on graceful shutdown
+```
+
+**Snapshot Interval:**
+- `0`: Disable automatic snapshots (only manual SAVE/BGSAVE)
+- `300`: Save every 5 minutes (recommended)
+- `600`: Save every 10 minutes (lower overhead)
+- `60`: Save every minute (higher overhead, more frequent saves)
+
+**Snapshot Commands:**
+- `SAVE`: Synchronous snapshot (blocks until complete)
+- `BGSAVE`: Background snapshot (returns immediately)
+- `LASTSAVE`: Get timestamp of last successful save
 
 ## Memory Management
 
