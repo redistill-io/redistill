@@ -51,7 +51,7 @@ fn test_store_delete() {
 
     store.set(key.clone(), value, None, now());
 
-    let count = store.delete(&[key.clone()]);
+    let count = store.delete(std::slice::from_ref(&key));
     assert_eq!(count, 1);
 
     let result = store.get(&key, now());
@@ -267,20 +267,20 @@ fn test_format_bytes() {
 #[test]
 fn test_eviction_policy_from_str() {
     assert_eq!(
-        EvictionPolicy::from_str("allkeys-lru"),
+        "allkeys-lru".parse::<EvictionPolicy>().unwrap(),
         EvictionPolicy::AllKeysLru
     );
     assert_eq!(
-        EvictionPolicy::from_str("allkeys-random"),
+        "allkeys-random".parse::<EvictionPolicy>().unwrap(),
         EvictionPolicy::AllKeysRandom
     );
     assert_eq!(
-        EvictionPolicy::from_str("noeviction"),
+        "noeviction".parse::<EvictionPolicy>().unwrap(),
         EvictionPolicy::NoEviction
     );
     // Default on unknown
     assert_eq!(
-        EvictionPolicy::from_str("unknown"),
+        "unknown".parse::<EvictionPolicy>().unwrap(),
         EvictionPolicy::AllKeysLru
     );
 }
@@ -316,7 +316,7 @@ fn test_config_defaults() {
     assert_eq!(config.memory.max_memory, 0);
     assert_eq!(config.memory.eviction_policy, "allkeys-lru");
     assert_eq!(config.security.password, "");
-    assert_eq!(config.security.tls_enabled, false);
+    assert!(!config.security.tls_enabled);
 }
 
 #[test]
@@ -553,20 +553,20 @@ fn test_entry_clone() {
 fn test_integer_value_storage() {
     let store = create_test_store();
     let key = Bytes::from("counter");
-    
+
     // Store integer as string (like Redis does)
     store.set(key.clone(), Bytes::from("42"), None, now());
-    
+
     let result = store.get(&key, now()).unwrap();
     assert_eq!(result.as_ref(), b"42");
-    
+
     // Parse and increment
     let val: i64 = std::str::from_utf8(&result).unwrap().parse().unwrap();
     assert_eq!(val, 42);
-    
+
     // Store incremented value
     store.set(key.clone(), Bytes::from((val + 1).to_string()), None, now());
-    
+
     let result = store.get(&key, now()).unwrap();
     assert_eq!(result.as_ref(), b"43");
 }
@@ -575,9 +575,9 @@ fn test_integer_value_storage() {
 fn test_negative_integer_storage() {
     let store = create_test_store();
     let key = Bytes::from("negative");
-    
+
     store.set(key.clone(), Bytes::from("-100"), None, now());
-    
+
     let result = store.get(&key, now()).unwrap();
     let val: i64 = std::str::from_utf8(&result).unwrap().parse().unwrap();
     assert_eq!(val, -100);
@@ -588,22 +588,22 @@ fn test_counter_with_ttl_preservation() {
     let store = create_test_store();
     let key = Bytes::from("ttl_counter");
     let timestamp = now();
-    
+
     // Set counter with TTL
     store.set(key.clone(), Bytes::from("10"), Some(60), timestamp);
-    
+
     // Simulate increment (get, parse, increment, set with same TTL)
     let shard = &store.shards[store.hash(&key)];
-    let existing_ttl = shard.get(key.as_ref()).and_then(|e| {
-        e.expiry.map(|exp| if exp > timestamp { exp - timestamp } else { 0 })
-    });
-    
+    let existing_ttl = shard
+        .get(key.as_ref())
+        .and_then(|e| e.expiry.map(|exp| exp.saturating_sub(timestamp)));
+
     assert!(existing_ttl.is_some());
     assert_eq!(existing_ttl.unwrap(), 60);
-    
+
     // Set new value preserving TTL
     store.set(key.clone(), Bytes::from("11"), existing_ttl, timestamp);
-    
+
     // Verify TTL is preserved
     let entry = shard.get(key.as_ref()).unwrap();
     assert!(entry.expiry.is_some());
@@ -615,30 +615,28 @@ fn test_counter_with_ttl_preservation() {
 #[test]
 fn test_bulk_set_and_get() {
     let store = create_test_store();
-    
+
     // Simulate MSET: set multiple key-value pairs
     let pairs = vec![
         (Bytes::from("key1"), Bytes::from("value1")),
         (Bytes::from("key2"), Bytes::from("value2")),
         (Bytes::from("key3"), Bytes::from("value3")),
     ];
-    
+
     for (key, value) in &pairs {
         store.set(key.clone(), value.clone(), None, now());
     }
-    
+
     // Simulate MGET: get multiple keys
-    let keys = vec![
+    let keys = [
         Bytes::from("key1"),
         Bytes::from("key2"),
         Bytes::from("key3"),
         Bytes::from("missing"),
     ];
-    
-    let results: Vec<Option<Bytes>> = keys.iter()
-        .map(|k| store.get(k, now()))
-        .collect();
-    
+
+    let results: Vec<Option<Bytes>> = keys.iter().map(|k| store.get(k, now())).collect();
+
     assert_eq!(results[0], Some(Bytes::from("value1")));
     assert_eq!(results[1], Some(Bytes::from("value2")));
     assert_eq!(results[2], Some(Bytes::from("value3")));
@@ -649,7 +647,7 @@ fn test_bulk_set_and_get() {
 fn test_bulk_operations_atomicity() {
     let store = Arc::new(create_test_store());
     let mut handles = vec![];
-    
+
     // Multiple threads doing MSET-like operations
     for i in 0..5 {
         let store_clone = Arc::clone(&store);
@@ -672,11 +670,11 @@ fn test_bulk_operations_atomicity() {
         });
         handles.push(handle);
     }
-    
+
     for handle in handles {
         handle.join().unwrap();
     }
-    
+
     // 5 threads * 100 iterations * 2 keys = 1000 keys
     assert_eq!(store.len(), 1000);
 }
@@ -687,25 +685,25 @@ fn test_bulk_operations_atomicity() {
 fn test_conditional_set_nx_behavior() {
     let store = create_test_store();
     let key = Bytes::from("nx_key");
-    
+
     // Simulate NX: only set if not exists
     // First check if key exists
     let exists = store.get(&key, now()).is_some();
     assert!(!exists);
-    
+
     // Key doesn't exist, so set it
     if !exists {
         store.set(key.clone(), Bytes::from("first"), None, now());
     }
-    
+
     // Now key exists
     let exists = store.get(&key, now()).is_some();
     assert!(exists);
-    
+
     // Simulate second NX attempt - should not overwrite
-    let should_set = !store.get(&key, now()).is_some();
+    let should_set = store.get(&key, now()).is_none();
     assert!(!should_set); // Should NOT set because key exists
-    
+
     // Value should still be "first"
     assert_eq!(store.get(&key, now()).unwrap(), Bytes::from("first"));
 }
@@ -714,28 +712,28 @@ fn test_conditional_set_nx_behavior() {
 fn test_conditional_set_xx_behavior() {
     let store = create_test_store();
     let key = Bytes::from("xx_key");
-    
+
     // Simulate XX: only set if exists
     // Key doesn't exist initially
     let exists = store.get(&key, now()).is_some();
     assert!(!exists);
-    
+
     // XX check: should NOT set because key doesn't exist
     let should_set = store.get(&key, now()).is_some();
     assert!(!should_set);
-    
+
     // Create the key first
     store.set(key.clone(), Bytes::from("original"), None, now());
-    
+
     // Now XX should work
     let should_set = store.get(&key, now()).is_some();
     assert!(should_set);
-    
+
     // Update with XX
     if should_set {
         store.set(key.clone(), Bytes::from("updated"), None, now());
     }
-    
+
     assert_eq!(store.get(&key, now()).unwrap(), Bytes::from("updated"));
 }
 
@@ -746,31 +744,31 @@ fn test_expire_on_existing_key() {
     let store = create_test_store();
     let key = Bytes::from("expire_test");
     let timestamp = now();
-    
+
     // Set key without TTL
     store.set(key.clone(), Bytes::from("value"), None, timestamp);
-    
+
     // Verify no expiry
     let shard = &store.shards[store.hash(&key)];
     {
         let entry = shard.get(key.as_ref()).unwrap();
         assert!(entry.expiry.is_none());
     }
-    
+
     // Simulate EXPIRE: update expiry using get_mut
     if let Some(mut entry) = shard.get_mut(key.as_ref()) {
         entry.expiry = Some(timestamp + 60);
     }
-    
+
     // Verify expiry was set
     {
         let entry = shard.get(key.as_ref()).unwrap();
         assert_eq!(entry.expiry, Some(timestamp + 60));
     }
-    
+
     // Key should still be accessible
     assert!(store.get(&key, timestamp).is_some());
-    
+
     // Key should be expired after TTL
     assert!(store.get(&key, timestamp + 61).is_none());
 }
@@ -780,29 +778,29 @@ fn test_ttl_calculation() {
     let store = create_test_store();
     let key = Bytes::from("ttl_calc");
     let timestamp = now();
-    
+
     // Set with 100 second TTL
     store.set(key.clone(), Bytes::from("value"), Some(100), timestamp);
-    
+
     let shard = &store.shards[store.hash(&key)];
     let entry = shard.get(key.as_ref()).unwrap();
-    
+
     // Calculate remaining TTL (like TTL command does)
     let remaining = match entry.expiry {
         Some(expiry) if expiry > timestamp => (expiry - timestamp) as i64,
         Some(_) => -2, // Expired
         None => -1,    // No TTL
     };
-    
+
     assert_eq!(remaining, 100);
-    
+
     // Check at t+30
     let remaining_at_30 = match entry.expiry {
         Some(expiry) if expiry > (timestamp + 30) => (expiry - (timestamp + 30)) as i64,
         Some(_) => -2,
         None => -1,
     };
-    
+
     assert_eq!(remaining_at_30, 70);
 }
 
@@ -811,29 +809,29 @@ fn test_persist_removes_ttl() {
     let store = create_test_store();
     let key = Bytes::from("persist_test");
     let timestamp = now();
-    
+
     // Set with TTL
     store.set(key.clone(), Bytes::from("value"), Some(60), timestamp);
-    
+
     let shard = &store.shards[store.hash(&key)];
-    
+
     // Verify TTL exists
     {
         let entry = shard.get(key.as_ref()).unwrap();
         assert!(entry.expiry.is_some());
     }
-    
+
     // Simulate PERSIST: remove expiry
     if let Some(mut entry) = shard.get_mut(key.as_ref()) {
         entry.expiry = None;
     }
-    
+
     // Verify TTL removed
     {
         let entry = shard.get(key.as_ref()).unwrap();
         assert!(entry.expiry.is_none());
     }
-    
+
     // Key should not expire now
     assert!(store.get(&key, timestamp + 1000).is_some());
 }
@@ -844,17 +842,17 @@ fn test_persist_removes_ttl() {
 fn test_set_returns_old_value() {
     let store = create_test_store();
     let key = Bytes::from("getset_key");
-    
+
     // Set initial value
     store.set(key.clone(), Bytes::from("old_value"), None, now());
-    
+
     // Get old value before setting new one (like SET ... GET)
     let old_value = store.get(&key, now());
     assert_eq!(old_value, Some(Bytes::from("old_value")));
-    
+
     // Set new value
     store.set(key.clone(), Bytes::from("new_value"), None, now());
-    
+
     // Verify new value
     assert_eq!(store.get(&key, now()), Some(Bytes::from("new_value")));
 }
@@ -865,11 +863,11 @@ fn test_set_returns_old_value() {
 fn test_large_integer_values() {
     let store = create_test_store();
     let key = Bytes::from("big_int");
-    
+
     // Test with large positive integer
     let large_val: i64 = 9_223_372_036_854_775_807; // i64::MAX
     store.set(key.clone(), Bytes::from(large_val.to_string()), None, now());
-    
+
     let result = store.get(&key, now()).unwrap();
     let parsed: i64 = std::str::from_utf8(&result).unwrap().parse().unwrap();
     assert_eq!(parsed, large_val);
@@ -879,9 +877,9 @@ fn test_large_integer_values() {
 fn test_zero_value() {
     let store = create_test_store();
     let key = Bytes::from("zero");
-    
+
     store.set(key.clone(), Bytes::from("0"), None, now());
-    
+
     let result = store.get(&key, now()).unwrap();
     let val: i64 = std::str::from_utf8(&result).unwrap().parse().unwrap();
     assert_eq!(val, 0);
@@ -891,12 +889,12 @@ fn test_zero_value() {
 fn test_rapid_counter_updates() {
     let store = Arc::new(create_test_store());
     let key = Bytes::from("rapid_counter");
-    
+
     // Initialize counter
     store.set(key.clone(), Bytes::from("0"), None, get_timestamp());
-    
+
     let mut handles = vec![];
-    
+
     // 10 threads each incrementing 100 times
     for _ in 0..10 {
         let store_clone = Arc::clone(&store);
@@ -905,7 +903,8 @@ fn test_rapid_counter_updates() {
             for _ in 0..100 {
                 // This simulates what INCR does, but without atomicity guarantees
                 // In real usage, the command handler provides serialization per-key
-                let current = store_clone.get(&key_clone, get_timestamp())
+                let current = store_clone
+                    .get(&key_clone, get_timestamp())
                     .map(|v| std::str::from_utf8(&v).unwrap().parse::<i64>().unwrap())
                     .unwrap_or(0);
                 store_clone.set(
@@ -918,19 +917,20 @@ fn test_rapid_counter_updates() {
         });
         handles.push(handle);
     }
-    
+
     for handle in handles {
         handle.join().unwrap();
     }
-    
+
     // Note: Without proper locking, the final value may be less than 1000
     // due to race conditions. This is expected - the actual INCR command
     // in main.rs handles this correctly with shard-level operations.
-    let final_val = store.get(&key, get_timestamp())
+    let final_val = store
+        .get(&key, get_timestamp())
         .map(|v| std::str::from_utf8(&v).unwrap().parse::<i64>().unwrap())
         .unwrap_or(0);
-    
+
     // Final value should be at least 10 (minimum if all races conflict)
     // and at most 1000 (if no races occurred)
-    assert!(final_val >= 10 && final_val <= 1000);
+    assert!((10..=1000).contains(&final_val));
 }

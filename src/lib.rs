@@ -9,6 +9,7 @@ pub use bytes::{Bytes, BytesMut};
 pub use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::hash::Hasher;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +40,7 @@ pub struct ServerConfig {
     pub health_check_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub password: String,
@@ -77,7 +78,7 @@ pub struct MemoryConfig {
     pub eviction_sample_size: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -152,17 +153,6 @@ impl Default for ServerConfig {
     }
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            password: String::new(),
-            tls_enabled: false,
-            tls_cert_path: String::new(),
-            tls_key_path: String::new(),
-        }
-    }
-}
-
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -191,37 +181,30 @@ impl Default for MemoryConfig {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            security: SecurityConfig::default(),
-            logging: LoggingConfig::default(),
-            performance: PerformanceConfig::default(),
-            memory: MemoryConfig::default(),
-        }
-    }
-}
-
 // ==================== Eviction Policy ====================
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum EvictionPolicy {
     NoEviction,
+    #[default]
     AllKeysLru,
     AllKeysRandom,
 }
 
-impl EvictionPolicy {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl FromStr for EvictionPolicy {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "allkeys-lru" => EvictionPolicy::AllKeysLru,
             "allkeys-random" => EvictionPolicy::AllKeysRandom,
             "noeviction" => EvictionPolicy::NoEviction,
             _ => EvictionPolicy::AllKeysLru, // default
-        }
+        })
     }
+}
 
+impl EvictionPolicy {
     pub fn as_str(&self) -> &'static str {
         match self {
             EvictionPolicy::NoEviction => "noeviction",
@@ -256,6 +239,15 @@ pub struct ShardedStore {
     pub num_shards: usize,
 }
 
+impl Clone for ShardedStore {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            num_shards: self.num_shards,
+        }
+    }
+}
+
 impl ShardedStore {
     pub fn new(num_shards: usize) -> Self {
         let mut shards = Vec::with_capacity(num_shards);
@@ -263,13 +255,6 @@ impl ShardedStore {
             shards.push(Arc::new(DashMap::with_capacity(1000)));
         }
         Self { shards, num_shards }
-    }
-
-    pub fn clone(&self) -> Self {
-        Self {
-            shards: self.shards.clone(),
-            num_shards: self.num_shards,
-        }
     }
 
     // Fast AHash with hardware acceleration (AES-NI)
@@ -300,13 +285,13 @@ impl ShardedStore {
 
         // Try read-only access first
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry {
-                if now >= expiry {
-                    // Expired - need to remove
-                    drop(entry);
-                    shard.remove(key);
-                    return None;
-                }
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
+                // Expired - need to remove
+                drop(entry);
+                shard.remove(key);
+                return None;
             }
 
             return Some(entry.value.clone());
@@ -341,10 +326,10 @@ impl ShardedStore {
         let mut count = 0;
         for key in keys {
             let shard = &self.shards[self.hash(key)];
-            if let Some(entry) = shard.get(key.as_ref()) {
-                if entry.expiry.is_none() || entry.expiry.unwrap() > now {
-                    count += 1;
-                }
+            if let Some(entry) = shard.get(key.as_ref())
+                && entry.expiry.is_none_or(|exp| exp > now)
+            {
+                count += 1;
             }
         }
         count
@@ -355,7 +340,7 @@ impl ShardedStore {
         for shard in &self.shards {
             for entry in shard.iter() {
                 let (key, val) = entry.pair();
-                if val.expiry.is_none() || val.expiry.unwrap() > now {
+                if val.expiry.is_none_or(|exp| exp > now) {
                     result.push(key.clone());
                 }
             }
@@ -365,6 +350,10 @@ impl ShardedStore {
 
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.is_empty())
     }
 
     pub fn clear(&self) {
@@ -380,8 +369,8 @@ impl ShardedStore {
 pub fn get_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // Calculate approximate size of an entry
@@ -427,6 +416,12 @@ pub fn eq_ignore_case_6(a: &[u8], b: &[u8; 6]) -> bool {
 // Connection state for authentication
 pub struct ConnectionState {
     pub authenticated: bool,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnectionState {
