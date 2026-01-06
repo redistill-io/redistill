@@ -59,9 +59,13 @@ async fn test_very_large_expiry_time() {
     println!("PTTL with large expiry: {} milliseconds", pttl);
     
     // PTTL should be approximately TTL * 1000, but may be capped at i64::MAX
-    let expected_pttl = (ttl as i64) * 1000;
-    if expected_pttl <= i64::MAX {
+    // Check if multiplication would overflow before computing
+    let ttl_i64 = ttl as i64;
+    let would_overflow = ttl_i64 > i64::MAX / 1000;
+    
+    if !would_overflow {
         // Normal case: should match within 1 second
+        let expected_pttl = ttl_i64 * 1000;
         assert!(
             (pttl - expected_pttl).abs() <= 1000,
             "PTTL mismatch: expected ~{}ms, got {}ms",
