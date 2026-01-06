@@ -118,9 +118,10 @@ async fn test_pttl_overflow_protection() {
     println!("i64::MAX: {} milliseconds", i64::MAX);
     
     // Should not overflow - should be capped at i64::MAX or calculated safely
+    // Since pttl is i64, it can't exceed i64::MAX, so we just check it's non-negative
     assert!(
-        pttl >= 0 && pttl <= i64::MAX,
-        "PTTL overflow: {}",
+        pttl >= 0,
+        "PTTL should be non-negative, got: {}",
         pttl
     );
     
