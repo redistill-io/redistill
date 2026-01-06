@@ -46,9 +46,15 @@ pub fn get_buffer() -> Vec<u8> {
 #[inline(always)]
 pub fn return_buffer(mut buf: Vec<u8>) {
     buf.clear();
+    // Return buffers that are reasonably sized, but don't keep extremely large ones
+    // This prevents pool draining while avoiding unbounded memory growth
     if buf.capacity() <= CONFIG.server.buffer_size * 2 {
         BUFFER_POOL.push(buf);
+    } else if buf.capacity() <= CONFIG.server.buffer_size * 4 && BUFFER_POOL.len() < CONFIG.server.buffer_pool_size / 4 {
+        // Keep some larger buffers if pool is getting low, but cap at 25% of pool size
+        BUFFER_POOL.push(buf);
     }
+    // Otherwise drop the buffer (too large or pool is full enough)
 }
 
 // ==================== Entry ====================
@@ -126,6 +132,19 @@ impl ShardedStore {
     }
 
     #[inline(always)]
+    pub fn get_existing_size(&self, key: &[u8], now: u64) -> Option<usize> {
+        let shard = &self.shards[self.hash(key)];
+        if let Some(entry) = shard.get(key) {
+            // Check if expired
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                return None;
+            }
+            return Some(entry_size(key.len(), entry.value.len()));
+        }
+        None
+    }
+
+    #[inline(always)]
     pub fn get(&self, key: &[u8], now: u64) -> Option<Bytes> {
         let shard = &self.shards[self.hash(key)];
 
@@ -133,11 +152,14 @@ impl ShardedStore {
             if let Some(expiry) = entry.expiry
                 && now >= expiry
             {
-                let key_len = key.len();
+                // Extract info before dropping to avoid race condition
+                let key_bytes = Bytes::copy_from_slice(key);
+                let key_len = key_bytes.len();
                 let value_len = entry.value.len();
                 drop(entry);
 
-                if shard.remove(key).is_some() && CONFIG.memory.max_memory > 0 {
+                // Atomic remove - only one thread can succeed
+                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
                     let size = entry_size(key_len, value_len);
                     MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
                 }
@@ -155,13 +177,16 @@ impl ShardedStore {
         let mut count = 0;
         for key in keys {
             let shard = &self.shards[self.hash(key)];
-            if let Some((_, entry)) = shard.remove(key)
-                && entry.expiry.is_none_or(|exp| now < exp)
-            {
-                count += 1;
+            if let Some((_, entry)) = shard.remove(key) {
+                // Always decrement memory if key was removed, regardless of expiry
+                // (expired keys still consume memory until removed)
                 if CONFIG.memory.max_memory > 0 {
                     let size = entry_size(key.len(), entry.value.len());
                     MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                }
+                // Only count as deleted if not expired (Redis semantics)
+                if entry.expiry.is_none_or(|exp| now < exp) {
+                    count += 1;
                 }
             }
         }
@@ -174,7 +199,7 @@ impl ShardedStore {
         for key in keys {
             let shard = &self.shards[self.hash(key)];
             if let Some(entry) = shard.get(key.as_ref())
-                && entry.expiry.is_none_or(|exp| exp > now)
+                && entry.expiry.is_none_or(|exp| now < exp)
             {
                 count += 1;
             }
@@ -297,7 +322,13 @@ fn evict_lru(store: &ShardedStore) -> usize {
         let shard_idx = fastrand::usize(..store.num_shards);
         let shard = &store.shards[shard_idx];
 
-        if let Some(entry) = shard.iter().next() {
+        // Sample a random entry from the shard
+        let len = shard.len();
+        if len == 0 {
+            continue;
+        }
+        let skip = fastrand::usize(..len);
+        if let Some(entry) = shard.iter().nth(skip) {
             let last_accessed = entry.value().last_accessed.load(Ordering::Relaxed);
 
             if oldest_key.is_none() || last_accessed < oldest_time {
@@ -327,7 +358,13 @@ fn evict_random(store: &ShardedStore) -> usize {
     let shard_idx = fastrand::usize(..store.num_shards);
     let shard = &store.shards[shard_idx];
 
-    if let Some(entry) = shard.iter().next() {
+    // Sample a random entry from the shard
+    let len = shard.len();
+    if len == 0 {
+        return 0;
+    }
+    let skip = fastrand::usize(..len);
+    if let Some(entry) = shard.iter().nth(skip) {
         let key = entry.key().clone();
         let key_len = key.len();
         drop(entry);
@@ -352,16 +389,25 @@ pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
         let shard_idx = fastrand::usize(..store.num_shards);
         let shard = &store.shards[shard_idx];
 
-        if let Some(entry) = shard.iter().next()
+        // Sample a random entry from the shard
+        let len = shard.len();
+        if len == 0 {
+            continue;
+        }
+        let skip = fastrand::usize(..len);
+        
+        if let Some(entry) = shard.iter().nth(skip)
             && let Some(expiry) = entry.value().expiry
             && now >= expiry
         {
+            // Extract info before dropping to avoid race condition
             let key = entry.key().clone();
             let key_len = key.len();
             let value_len = entry.value().value.len();
             drop(entry);
 
-            if shard.remove(&key).is_some() {
+            // Atomic remove - only one thread can succeed
+            if shard.remove(key.as_ref()).is_some() {
                 expired_count += 1;
                 if CONFIG.memory.max_memory > 0 {
                     let size = entry_size(key_len, value_len);

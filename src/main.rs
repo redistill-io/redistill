@@ -45,6 +45,11 @@ use store::{
 // Server start time for uptime tracking
 static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
 
+// Thread-local command counter for batching updates
+thread_local! {
+    static LOCAL_CMD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // ==================== Background Tasks ====================
 
 async fn expiration_task(store: ShardedStore) {
@@ -66,10 +71,6 @@ fn execute_command(
     now: u64,
 ) {
     // Batch counter updates
-    thread_local! {
-        static LOCAL_CMD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-
     LOCAL_CMD_COUNT.with(|count| {
         let new_count = count.get() + 1;
         if new_count >= 256 {
@@ -240,8 +241,43 @@ fn execute_command(
                     cmd[6] | 0x20,
                 ];
                 if &lower == b"flushdb" {
+                    // Calculate actual memory that will be freed by iterating the store
+                    // This ensures we only subtract what's actually being cleared
+                    let now = get_timestamp();
+                    let mut actual_memory = 0u64;
+                    for shard in &store.shards {
+                        for entry in shard.iter() {
+                            let (key, val) = entry.pair();
+                            // Only count non-expired keys (expired keys already have memory freed)
+                            if val.expiry.is_none_or(|exp| now < exp) {
+                                actual_memory += entry_size(key.len(), val.value.len()) as u64;
+                            }
+                        }
+                    }
+                    
+                    // Clear the store first
                     store.clear();
-                    MEMORY_USED.store(0, Ordering::Relaxed);
+                    
+                    // Now subtract the calculated memory using CAS to handle concurrent operations
+                    // We need to handle the case where other threads modified MEMORY_USED
+                    // between our calculation and the subtraction
+                    loop {
+                        let current = MEMORY_USED.load(Ordering::Relaxed);
+                        if actual_memory >= current {
+                            // Calculated memory >= current (concurrent operations freed more than we calculated)
+                            // Set to 0 to avoid underflow - any extra was from concurrent operations
+                            if MEMORY_USED.compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                break;
+                            }
+                        } else {
+                            // Normal case: subtract what we calculated
+                            let new_value = current - actual_memory;
+                            if MEMORY_USED.compare_exchange(current, new_value, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                break;
+                            }
+                        }
+                        // CAS failed - another thread modified MEMORY_USED, retry with new value
+                    }
                     writer.write_simple_string(b"OK");
                     return;
                 }
@@ -272,8 +308,43 @@ fn execute_command(
                     return;
                 }
                 if &lower == b"flushall" {
+                    // Calculate actual memory that will be freed by iterating the store
+                    // This ensures we only subtract what's actually being cleared
+                    let now = get_timestamp();
+                    let mut actual_memory = 0u64;
+                    for shard in &store.shards {
+                        for entry in shard.iter() {
+                            let (key, val) = entry.pair();
+                            // Only count non-expired keys (expired keys already have memory freed)
+                            if val.expiry.is_none_or(|exp| now < exp) {
+                                actual_memory += entry_size(key.len(), val.value.len()) as u64;
+                            }
+                        }
+                    }
+                    
+                    // Clear the store first
                     store.clear();
-                    MEMORY_USED.store(0, Ordering::Relaxed);
+                    
+                    // Now subtract the calculated memory using CAS to handle concurrent operations
+                    // We need to handle the case where other threads modified MEMORY_USED
+                    // between our calculation and the subtraction
+                    loop {
+                        let current = MEMORY_USED.load(Ordering::Relaxed);
+                        if actual_memory >= current {
+                            // Calculated memory >= current (concurrent operations freed more than we calculated)
+                            // Set to 0 to avoid underflow - any extra was from concurrent operations
+                            if MEMORY_USED.compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                break;
+                            }
+                        } else {
+                            // Normal case: subtract what we calculated
+                            let new_value = current - actual_memory;
+                            if MEMORY_USED.compare_exchange(current, new_value, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                break;
+                            }
+                        }
+                        // CAS failed - another thread modified MEMORY_USED, retry with new value
+                    }
                     writer.write_simple_string(b"OK");
                     return;
                 }
@@ -384,7 +455,11 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
 
     if nx && key_exists {
         if get {
-            writer.write_bulk_string(&old_value.unwrap());
+            if let Some(v) = old_value {
+                writer.write_bulk_string(&v);
+            } else {
+                writer.write_null();
+            }
         } else {
             writer.write_null();
         }
@@ -428,8 +503,17 @@ fn handle_ttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
         Some(entry) => match entry.expiry {
             Some(expiry) => {
                 if now >= expiry {
+                    // Extract info before dropping to avoid race condition
+                    let key_bytes = Bytes::copy_from_slice(key);
+                    let key_len = key_bytes.len();
+                    let value_len = entry.value.len();
                     drop(entry);
-                    shard.remove(key.as_ref());
+                    
+                    // Atomic remove - only one thread can succeed
+                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                        let size = entry_size(key_len, value_len);
+                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    }
                     writer.write_signed_integer(-2);
                 } else {
                     writer.write_signed_integer((expiry - now) as i64);
@@ -454,11 +538,24 @@ fn handle_pttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
         Some(entry) => match entry.expiry {
             Some(expiry) => {
                 if now >= expiry {
+                    // Extract info before dropping to avoid race condition
+                    let key_bytes = Bytes::copy_from_slice(key);
+                    let key_len = key_bytes.len();
+                    let value_len = entry.value.len();
                     drop(entry);
-                    shard.remove(key.as_ref());
+                    
+                    // Atomic remove - only one thread can succeed
+                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                        let size = entry_size(key_len, value_len);
+                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    }
                     writer.write_signed_integer(-2);
                 } else {
-                    writer.write_signed_integer(((expiry - now) * 1000) as i64);
+                    // Calculate milliseconds with overflow protection
+                    let diff = expiry.saturating_sub(now);
+                    let millis = diff.saturating_mul(1000);
+                    let result = millis.min(i64::MAX as u64) as i64;
+                    writer.write_signed_integer(result);
                 }
             }
             None => writer.write_signed_integer(-1),
@@ -482,33 +579,48 @@ fn handle_incr(
     let key = &command[1];
     let shard = &store.shards[store.hash(key)];
 
-    let current = match shard.get(key.as_ref()) {
+    // Read key once to get value, TTL, and old size atomically
+    let (current, existing_ttl, old_size_for_eviction) = match shard.get(key.as_ref()) {
         Some(entry) => {
             if let Some(expiry) = entry.expiry {
                 if now >= expiry {
+                    // Expired - remove it, treat as 0, no TTL to preserve
+                    let key_bytes = Bytes::copy_from_slice(key);
+                    let key_len = key_bytes.len();
+                    let value_len = entry.value.len();
                     drop(entry);
-                    shard.remove(key.as_ref());
-                    0i64
+                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                        let size = entry_size(key_len, value_len);
+                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    }
+                    (0i64, None, 0)
                 } else {
-                    match parse_i64(&entry.value) {
+                    // Not expired - parse value and preserve TTL
+                    let value = match parse_i64(&entry.value) {
                         Some(v) => v,
                         None => {
                             writer.write_error(b"value is not an integer or out of range");
                             return;
                         }
-                    }
+                    };
+                    let ttl = Some(expiry.saturating_sub(now));
+                    let old_size = entry_size(key.len(), entry.value.len());
+                    (value, ttl, old_size)
                 }
             } else {
-                match parse_i64(&entry.value) {
+                // No expiry - parse value, no TTL
+                let value = match parse_i64(&entry.value) {
                     Some(v) => v,
                     None => {
                         writer.write_error(b"value is not an integer or out of range");
                         return;
                     }
-                }
+                };
+                let old_size = entry_size(key.len(), entry.value.len());
+                (value, None, old_size)
             }
         }
-        None => 0i64,
+        None => (0i64, None, 0),
     };
 
     let new_val = if delta > 0 {
@@ -531,15 +643,14 @@ fn handle_incr(
 
     let val_bytes = Bytes::from(new_val.to_string());
     let size = entry_size(key.len(), val_bytes.len());
+    
+    let net_size = size.saturating_sub(old_size_for_eviction);
 
-    if !evict_if_needed(store, size) {
+    if net_size > 0 && !evict_if_needed(store, net_size) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
         return;
     }
 
-    let existing_ttl = shard
-        .get(key.as_ref())
-        .and_then(|e| e.expiry.map(|exp| exp.saturating_sub(now)));
     let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
 
     if CONFIG.memory.max_memory > 0 {
@@ -581,7 +692,14 @@ fn handle_decrby(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrite
             return;
         }
     };
-    handle_incr(store, command, writer, now, -decrement);
+    // Check for overflow: -i64::MIN cannot be represented as i64
+    let delta = if decrement == i64::MIN {
+        writer.write_error(b"value is not an integer or out of range");
+        return;
+    } else {
+        -decrement
+    };
+    handle_incr(store, command, writer, now, delta);
 }
 
 #[inline(always)]
@@ -607,14 +725,20 @@ fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
     }
 
     let pairs = (command.len() - 1) / 2;
-    let mut total_size = 0;
+    // Calculate net memory change by checking existing keys
+    let mut net_size = 0i64;
     for i in 0..pairs {
         let key = &command[1 + i * 2];
         let value = &command[2 + i * 2];
-        total_size += entry_size(key.len(), value.len());
+        let new_size = entry_size(key.len(), value.len()) as i64;
+        
+        // Check if key exists and get old size
+        let old_size = store.get_existing_size(key, now).unwrap_or(0) as i64;
+        net_size += new_size - old_size;
     }
 
-    if !evict_if_needed(store, total_size) {
+    // Only evict if net increase is positive
+    if net_size > 0 && !evict_if_needed(store, net_size as usize) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
         return;
     }
@@ -824,6 +948,15 @@ async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
             Ok(Err(_)) | Err(_) => break,
         }
     }
+
+    // Flush remaining command count before connection closes
+    LOCAL_CMD_COUNT.with(|count| {
+        let remaining = count.get();
+        if remaining > 0 {
+            TOTAL_COMMANDS.fetch_add(remaining, Ordering::Relaxed);
+            count.set(0);
+        }
+    });
 
     let _ = writer.flush(&mut stream).await;
     ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);

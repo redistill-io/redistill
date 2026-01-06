@@ -162,7 +162,7 @@ Self-signed certificates are provided in `tests/certs/` for TLS testing.
 ./tests/scripts/generate_test_certs.sh
 ```
 
-⚠️ **Never use these in production!** Get real certificates from:
+**Never use these in production!** Get real certificates from:
 - Let's Encrypt (free)
 - Your Certificate Authority
 - Cloud provider (AWS, GCP, Azure)

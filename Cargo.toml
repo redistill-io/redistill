@@ -32,6 +32,9 @@ subtle = "2"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"
 
+[dev-dependencies]
+redis = "0.24"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
