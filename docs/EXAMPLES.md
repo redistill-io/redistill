@@ -282,6 +282,55 @@ With 2GB limit and LRU eviction:
 - Cache hit rate remains high (85-95%)
 ```
 
+## Key Scanning with SCAN
+
+The `SCAN` command allows safe iteration through keys without blocking the server (unlike `KEYS *`).
+
+```python
+import redis
+
+cache = redis.Redis(host='localhost', port=6379)
+
+def scan_keys(pattern='*', count=100):
+    """Safely scan all keys matching a pattern"""
+    cursor = 0
+    all_keys = []
+    
+    while True:
+        cursor, keys = cache.scan(cursor=cursor, match=pattern, count=count)
+        all_keys.extend(keys)
+        
+        if cursor == 0:
+            break  # Iteration complete
+    
+    return all_keys
+
+# Example: Find all session keys
+session_keys = scan_keys(pattern='session:*')
+print(f"Found {len(session_keys)} session keys")
+
+# Example: Find all API cache keys
+api_keys = scan_keys(pattern='api:*', count=50)
+print(f"Found {len(api_keys)} API cache keys")
+```
+
+```bash
+# Using redis-cli
+# Start scanning
+redis-cli SCAN 0 MATCH "user:*" COUNT 100
+
+# Continue with returned cursor
+redis-cli SCAN 2048000000001 MATCH "user:*" COUNT 100
+
+# Iterate until cursor returns to 0
+```
+
+**Key Benefits:**
+- **Non-blocking**: Doesn't block other operations like `KEYS *` does
+- **Pattern filtering**: Filter keys with glob patterns (`*`, `?`)
+- **Configurable batches**: Control how many keys per iteration
+- **Production-safe**: Use in monitoring scripts and admin tools
+
 ## Best Practices
 
 1. **Set appropriate TTLs** - Balance freshness vs cache hit rate
@@ -291,6 +340,7 @@ With 2GB limit and LRU eviction:
 5. **Handle cache misses gracefully** - Always have a fallback to source data
 6. **Use connection pooling** - Reuse connections for better performance
 7. **Implement circuit breakers** - Degrade gracefully if cache is unavailable
+8. **Use SCAN instead of KEYS** - For production monitoring and key inspection
 
 ## See Also
 
