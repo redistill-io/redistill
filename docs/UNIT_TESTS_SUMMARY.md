@@ -17,7 +17,7 @@ Successfully moved all unit tests from `src/main.rs` to a separate test structur
 - Tests now run as separate compilation unit
 
 ### 3. Test Coverage (32 Tests)
-✅ **Storage Operations**: SET, GET, DELETE, EXISTS, KEYS
+✅ **Storage Operations**: SET, GET, DELETE, EXISTS, KEYS, SCAN
 ✅ **TTL/Expiration**: Basic TTL, edge cases, multiple keys with different TTLs
 ✅ **Concurrent Access**: Multi-threaded operations (10 threads × 100 ops)
 ✅ **Eviction Policies**: LRU, Random, NoEviction, zero-cost abstraction

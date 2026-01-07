@@ -180,6 +180,18 @@ fn execute_command(
                 handle_info(store, writer);
                 return;
             }
+            if cmd.len() == 4 {
+                let lower = [
+                    cmd[0] | 0x20,
+                    cmd[1] | 0x20,
+                    cmd[2] | 0x20,
+                    cmd[3] | 0x20,
+                ];
+                if &lower == b"scan" {
+                    handle_scan(store, command, writer, now);
+                    return;
+                }
+            }
         }
         6 => {
             if eq_ignore_case_6(cmd, b"exists") {
@@ -864,8 +876,17 @@ fn handle_expire(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrite
         if let Some(expiry) = entry.expiry
             && now >= expiry
         {
+            // Extract info before dropping to avoid race condition
+            let key_bytes = Bytes::copy_from_slice(key);
+            let key_len = key_bytes.len();
+            let value_len = entry.value.len();
             drop(entry);
-            shard.remove(key.as_ref());
+            
+            // Atomic remove - only one thread can succeed
+            if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                let size = entry_size(key_len, value_len);
+                MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+            }
             writer.write_integer(0);
             return;
         }
@@ -873,6 +894,66 @@ fn handle_expire(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrite
         writer.write_integer(1);
     } else {
         writer.write_integer(0);
+    }
+}
+
+fn handle_scan(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+    if command.len() < 2 {
+        writer.write_error(b"wrong number of arguments for 'scan' command");
+        return;
+    }
+
+    // Parse cursor (must be provided)
+    let cursor = match parse_u64(&command[1]) {
+        Some(c) => c,
+        None => {
+            writer.write_error(b"invalid cursor");
+            return;
+        }
+    };
+
+    let mut count_hint = 10; // Default count hint
+    let mut pattern: Option<Bytes> = None;
+
+    // Parse optional arguments: MATCH pattern, COUNT count
+    let mut i = 2;
+    while i < command.len() {
+        let arg = &command[i];
+        let arg_lower: Vec<u8> = arg.iter().map(|b| b | 0x20).collect();
+
+        if arg_lower == b"match" && i + 1 < command.len() {
+            i += 1;
+            pattern = Some(command[i].clone());
+        } else if arg_lower == b"count" && i + 1 < command.len() {
+            i += 1;
+            match parse_u64(&command[i]) {
+                Some(c) => count_hint = c as usize,
+                None => {
+                    writer.write_error(b"value is not an integer or out of range");
+                    return;
+                }
+            }
+        } else {
+            writer.write_error(b"syntax error");
+            return;
+        }
+        i += 1;
+    }
+
+    // Perform scan
+    let (new_cursor, keys) = store.scan(
+        cursor,
+        count_hint,
+        pattern.as_ref().map(|p| p.as_ref()),
+        now,
+    );
+
+    // Write response: [cursor, [key1, key2, ...]]
+    writer.write_array_header(2);
+    writer.write_bulk_string(new_cursor.to_string().as_bytes());
+    writer.write_array_header(keys.len());
+    for key in &keys {
+        writer.write_bulk_string(key);
     }
 }
 
@@ -887,8 +968,17 @@ fn handle_persist(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrit
     if let Some(mut entry) = shard.get_mut(key.as_ref()) {
         if let Some(expiry) = entry.expiry {
             if now >= expiry {
+                // Extract info before dropping to avoid race condition
+                let key_bytes = Bytes::copy_from_slice(key);
+                let key_len = key_bytes.len();
+                let value_len = entry.value.len();
                 drop(entry);
-                shard.remove(key.as_ref());
+                
+                // Atomic remove - only one thread can succeed
+                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                    let size = entry_size(key_len, value_len);
+                    MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                }
                 writer.write_integer(0);
             } else {
                 entry.expiry = None;

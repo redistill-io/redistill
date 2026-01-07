@@ -33,7 +33,12 @@
 - `EXISTS key [key ...]` - Check key existence
 - `MSET key value [key value ...]` - Set multiple keys atomically
 - `MGET key [key ...]` - Get multiple keys in one call
-- `KEYS` - List all keys (use with caution in production)
+- `KEYS pattern` - List all keys matching pattern (use with caution in production - blocks server)
+- `SCAN cursor [MATCH pattern] [COUNT count]` - Iterate keys safely (non-blocking)
+  - `cursor` - Cursor value (0 to start, or previous cursor from last scan)
+  - `MATCH pattern` - Optional glob pattern (e.g., `user:*`, `session:?*`)
+  - `COUNT count` - Optional hint for number of keys to return (default: 10)
+  - Returns: `[cursor, [key1, key2, ...]]` - cursor 0 indicates completion
 - `DBSIZE` - Get total key count
 - `FLUSHDB` - Clear all keys
 
@@ -219,7 +224,6 @@ The following Redis features are intentionally not implemented:
 Potential additions based on user feedback:
 
 ### High Priority
-- Key scanning (`SCAN` for safer iteration than KEYS)
 - `APPEND key value` - Append to string
 - `STRLEN key` - Get string length
 - `INCRBYFLOAT key increment` - Float counter support
@@ -282,6 +286,7 @@ Potential additions based on user feedback:
 | Counter commands | INCR, DECR, INCRBY, DECRBY | Full set |
 | TTL commands | EXPIRE, TTL, PTTL, PERSIST | Full set |
 | Bulk operations | MGET, MSET | Full set |
+| Key scanning | SCAN (non-blocking), KEYS (blocking) | Full set |
 | Conditional SET | NX, XX, GET options | Full set |
 | Persistence | None | AOF, RDB |
 | Replication | None | Master-replica |

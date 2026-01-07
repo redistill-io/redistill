@@ -53,6 +53,13 @@ OK
 > GET mykey
 "Hello Redistill"
 
+> SCAN 0
+1) "0"
+2) 1) "mykey"
+
+> DEL mykey
+"Hello Redistill"
+
 > DEL mykey
 (integer) 1
 ```

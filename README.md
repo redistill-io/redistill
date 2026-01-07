@@ -314,6 +314,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `EXISTS key [key ...]` - Check existence
 - `MSET key value [key value ...]` - Set multiple keys
 - `MGET key [key ...]` - Get multiple keys
+- `SCAN cursor [MATCH pattern] [COUNT count]` - Iterate keys (non-blocking)
 
 **Counter Commands:**
 - `INCR key` - Increment by 1
@@ -336,6 +337,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `PING` - Health check
 - `INFO` - Server statistics
 - `DBSIZE` - Key count
+- `KEYS pattern` - List keys matching pattern (use with caution)
 - `FLUSHDB` / `FLUSHALL` - Clear all data
 - `AUTH password` - Authenticate
 

@@ -220,6 +220,81 @@ impl ShardedStore {
         result
     }
 
+    /// Scan keys with cursor-based iteration
+    /// Returns (new_cursor, keys_found)
+    /// Cursor encoding: shard_idx * 1_000_000_000 + position_in_shard
+    /// Cursor 0 means iteration complete
+    pub fn scan(
+        &self,
+        cursor: u64,
+        count_hint: usize,
+        pattern: Option<&[u8]>,
+        now: u64,
+    ) -> (u64, Vec<Bytes>) {
+        let mut result = Vec::new();
+        let mut keys_checked = 0;
+        let count = count_hint.max(10).min(1000); // Clamp count between 10-1000
+
+        // Decode cursor: shard_idx and position within shard
+        let start_shard = (cursor / 1_000_000_000) as usize;
+        let start_position = (cursor % 1_000_000_000) as usize;
+
+        if start_shard >= self.num_shards {
+            return (0, result); // Cursor out of range, iteration complete
+        }
+
+        // Iterate through shards starting from cursor position
+        let mut current_shard = start_shard;
+        let mut current_position = start_position;
+        
+        while current_shard < self.num_shards {
+            let shard = &self.shards[current_shard];
+            let entries: Vec<_> = shard.iter().collect(); // Collect to avoid holding lock during processing
+
+            for (pos, entry) in entries.iter().enumerate().skip(current_position) {
+                // Check if we have enough keys or checked enough entries
+                if result.len() >= count || keys_checked >= count * 3 {
+                    // Encode new cursor position
+                    let new_cursor = if pos + 1 < entries.len() {
+                        // Still in this shard
+                        (current_shard as u64) * 1_000_000_000 + (pos + 1) as u64
+                    } else if current_shard + 1 < self.num_shards {
+                        // Move to next shard
+                        ((current_shard + 1) as u64) * 1_000_000_000
+                    } else {
+                        // Reached end
+                        0
+                    };
+                    return (new_cursor, result);
+                }
+
+                keys_checked += 1;
+                let (key, val) = entry.pair();
+
+                // Skip expired keys
+                if val.expiry.is_some_and(|exp| now >= exp) {
+                    continue;
+                }
+
+                // Apply pattern matching if provided
+                if let Some(pat) = pattern {
+                    if !matches_pattern(key, pat) {
+                        continue;
+                    }
+                }
+
+                result.push(key.clone());
+            }
+            
+            // Move to next shard
+            current_shard += 1;
+            current_position = 0;
+        }
+
+        // Iteration complete
+        (0, result)
+    }
+
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
     }
@@ -418,4 +493,46 @@ pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
     }
 
     expired_count
+}
+
+// ==================== Pattern Matching ====================
+
+/// Simple glob pattern matching for SCAN MATCH
+/// Supports:
+/// - * matches any sequence of characters
+/// - ? matches any single character
+/// - Literal characters match exactly
+fn matches_pattern(key: &[u8], pattern: &[u8]) -> bool {
+    let key_len = key.len();
+    let pat_len = pattern.len();
+    let mut key_idx = 0;
+    let mut pat_idx = 0;
+    let mut star_pos: Option<usize> = None;
+    let mut key_backup = 0;
+
+    while key_idx < key_len {
+        if pat_idx < pat_len && pattern[pat_idx] == b'*' {
+            star_pos = Some(pat_idx);
+            key_backup = key_idx;
+            pat_idx += 1;
+        } else if pat_idx < pat_len
+            && (pattern[pat_idx] == b'?' || pattern[pat_idx] == key[key_idx])
+        {
+            key_idx += 1;
+            pat_idx += 1;
+        } else if let Some(star) = star_pos {
+            pat_idx = star + 1;
+            key_backup += 1;
+            key_idx = key_backup;
+        } else {
+            return false;
+        }
+    }
+
+    // Handle trailing stars
+    while pat_idx < pat_len && pattern[pat_idx] == b'*' {
+        pat_idx += 1;
+    }
+
+    pat_idx == pat_len
 }
