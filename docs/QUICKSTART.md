@@ -62,6 +62,21 @@ OK
 
 > DEL mykey
 (integer) 1
+
+# Hash operations
+> HSET user:1001 name "John" age "30" city "NYC"
+(integer) 3
+
+> HGET user:1001 name
+"John"
+
+> HGETALL user:1001
+1) "name"
+2) "John"
+3) "age"
+4) "30"
+5) "city"
+6) "NYC"
 ```
 
 ## With Authentication

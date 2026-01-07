@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::CONFIG;
-use crate::store::{Entry, MEMORY_USED, ShardedStore, entry_size, get_timestamp};
+use crate::store::{Entry, EntryValue, MEMORY_USED, ShardedStore, calculate_entry_size, get_timestamp};
+use std::sync::Arc;
+use dashmap::DashMap;
 
 // ==================== Snapshot Constants ====================
 
@@ -22,7 +24,21 @@ pub static LAST_SAVE_TIME: AtomicU64 = AtomicU64::new(0);
 // ==================== Snapshot Entry ====================
 
 #[derive(Serialize, Deserialize)]
+enum SnapshotValue {
+    String(Vec<u8>),
+    Hash(Vec<(Vec<u8>, Vec<u8>)>), // Vec of (field, value) pairs
+}
+
+#[derive(Serialize, Deserialize)]
 struct SnapshotEntry {
+    key: Vec<u8>,
+    value: SnapshotValue,
+    expiry: Option<u64>,
+}
+
+// Backward compatibility: old format without type discriminator
+#[derive(Serialize, Deserialize)]
+struct LegacySnapshotEntry {
     key: Vec<u8>,
     value: Vec<u8>,
     expiry: Option<u64>,
@@ -77,9 +93,20 @@ pub fn save_snapshot_sync(store: &ShardedStore, path: &str) -> Result<usize, Str
                     continue;
                 }
 
+                let snapshot_value = match &val.value {
+                    EntryValue::String(bytes) => SnapshotValue::String(bytes.to_vec()),
+                    EntryValue::Hash(hash_map) => {
+                        let mut fields = Vec::new();
+                        for entry in hash_map.iter() {
+                            fields.push((entry.key().to_vec(), entry.value().to_vec()));
+                        }
+                        SnapshotValue::Hash(fields)
+                    }
+                };
+
                 let snapshot_entry = SnapshotEntry {
                     key: key.to_vec(),
-                    value: val.value.to_vec(),
+                    value: snapshot_value,
                     expiry: val.expiry,
                 };
 
@@ -183,28 +210,47 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
             .read_exact(&mut entry_data)
             .map_err(|e| format!("Failed to read entry data: {}", e))?;
 
-        let snapshot_entry: SnapshotEntry = bincode::deserialize(&entry_data)
-            .map_err(|e| format!("Failed to deserialize entry: {}", e))?;
+        // Try to deserialize as new format first, fall back to legacy format
+        let (key, entry_value, expiry) = match bincode::deserialize::<SnapshotEntry>(&entry_data) {
+            Ok(snapshot_entry) => {
+                // New format with type discriminator
+                let expiry = snapshot_entry.expiry;
+                let value = match snapshot_entry.value {
+                    SnapshotValue::String(bytes) => EntryValue::String(Bytes::from(bytes)),
+                    SnapshotValue::Hash(fields) => {
+                        let hash_map = Arc::new(DashMap::new());
+                        for (field, val) in fields {
+                            hash_map.insert(Bytes::from(field), Bytes::from(val));
+                        }
+                        EntryValue::Hash(hash_map)
+                    }
+                };
+                (Bytes::from(snapshot_entry.key), value, expiry)
+            }
+            Err(_) => {
+                // Legacy format (backward compatibility)
+                let legacy_entry: LegacySnapshotEntry = bincode::deserialize(&entry_data)
+                    .map_err(|e| format!("Failed to deserialize entry: {}", e))?;
+                (
+                    Bytes::from(legacy_entry.key),
+                    EntryValue::String(Bytes::from(legacy_entry.value)),
+                    legacy_entry.expiry,
+                )
+            }
+        };
 
         // Skip expired entries
-        if let Some(expiry) = snapshot_entry.expiry
-            && now >= expiry
-        {
+        if let Some(exp) = expiry && now >= exp {
             skipped_expired += 1;
             continue;
         }
 
         // Calculate remaining TTL
-        let ttl = snapshot_entry
-            .expiry
-            .and_then(|exp| if exp > now { Some(exp - now) } else { None });
-
-        let key = Bytes::from(snapshot_entry.key);
-        let value = Bytes::from(snapshot_entry.value);
+        let ttl = expiry.and_then(|exp| if exp > now { Some(exp - now) } else { None });
 
         // Track memory
         if CONFIG.memory.max_memory > 0 {
-            let size = entry_size(key.len(), value.len());
+            let size = calculate_entry_size(key.len(), &entry_value);
             MEMORY_USED.fetch_add(size as u64, Ordering::Relaxed);
         }
 
@@ -213,7 +259,7 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
         shard.insert(
             key,
             Entry {
-                value,
+                value: entry_value,
                 expiry: ttl.map(|t| now + t),
                 last_accessed: AtomicU32::new(0),
             },

@@ -453,7 +453,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | Persistence | Optional (snapshots) | Yes (AOF/RDB) | Yes (AOF/RDB) |
 | Replication | No | Yes | Yes |
 | Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
-| Data types | String (KV) | Full Redis | Full Redis |
+| Data types | String (KV) + Hash | Full Redis | Full Redis |
 | Best for | High-performance KV workloads | General purpose | General purpose |
 | License | MIT | BSL | BSD |
 

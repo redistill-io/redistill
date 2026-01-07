@@ -131,6 +131,210 @@ app.get('/api/products', cacheMiddleware(600), async (req, res) => {
 // Cache HIT: ~2ms (100x faster!)
 ```
 
+## Hash Data Structure
+
+Hash data structures allow you to store multiple field-value pairs within a single key, perfect for user profiles, configuration objects, and structured data.
+
+### Basic Hash Operations
+
+```bash
+# Create a user profile hash
+redis-cli HSET user:1001 name "John Doe" email "john@example.com" age "30" city "New York"
+# Returns: (integer) 4  (4 fields were newly set)
+
+# Get a single field
+redis-cli HGET user:1001 name
+# Returns: "John Doe"
+
+# Get all fields and values
+redis-cli HGETALL user:1001
+# Returns:
+# 1) "name"
+# 2) "John Doe"
+# 3) "email"
+# 4) "john@example.com"
+# 5) "age"
+# 6) "30"
+# 7) "city"
+# 8) "New York"
+
+# Update existing fields
+redis-cli HSET user:1001 age "31" city "San Francisco"
+# Returns: (integer) 0  (no new fields, only updates)
+```
+
+### User Profile Management (Python)
+
+```python
+import redis
+
+cache = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+def create_user_profile(user_id, profile_data):
+    """Create or update a user profile using hash"""
+    key = f"user:{user_id}"
+    # HSET accepts dict or keyword arguments
+    cache.hset(key, mapping=profile_data)
+    return True
+
+def get_user_profile(user_id):
+    """Get complete user profile"""
+    key = f"user:{user_id}"
+    profile = cache.hgetall(key)
+    return profile if profile else None
+
+def update_user_field(user_id, field, value):
+    """Update a single field in user profile"""
+    key = f"user:{user_id}"
+    cache.hset(key, field, value)
+    return True
+
+# Example usage
+create_user_profile(1001, {
+    'name': 'John Doe',
+    'email': 'john@example.com',
+    'age': '30',
+    'city': 'New York',
+    'role': 'admin'
+})
+
+profile = get_user_profile(1001)
+# Returns: {'name': 'John Doe', 'email': 'john@example.com', ...}
+
+update_user_field(1001, 'age', '31')
+```
+
+### Configuration Objects (Node.js)
+
+```javascript
+const Redis = require('ioredis');
+const redis = new Redis({ host: 'localhost', port: 6379 });
+
+// Store application configuration as hash
+async function setAppConfig(appId, config) {
+  const key = `config:${appId}`;
+  await redis.hset(key, config);
+}
+
+async function getAppConfig(appId) {
+  const key = `config:${appId}`;
+  return await redis.hgetall(key);
+}
+
+async function getConfigField(appId, field) {
+  const key = `config:${appId}`;
+  return await redis.hget(key, field);
+}
+
+// Example: Store API configuration
+await setAppConfig('api-v1', {
+  'rate_limit': '1000',
+  'timeout': '30',
+  'max_connections': '100',
+  'cache_ttl': '300'
+});
+
+// Get specific configuration value
+const rateLimit = await getConfigField('api-v1', 'rate_limit');
+console.log(`Rate limit: ${rateLimit}`); // "1000"
+
+// Get all configuration
+const config = await getAppConfig('api-v1');
+console.log(config);
+// { rate_limit: '1000', timeout: '30', max_connections: '100', cache_ttl: '300' }
+```
+
+### Product Catalog (Go)
+
+```go
+package main
+
+import (
+    "github.com/redis/go-redis/v9"
+    "context"
+)
+
+func storeProduct(ctx context.Context, rdb *redis.Client, productID string, product map[string]string) error {
+    key := "product:" + productID
+    return rdb.HSet(ctx, key, product).Err()
+}
+
+func getProduct(ctx context.Context, rdb *redis.Client, productID string) (map[string]string, error) {
+    key := "product:" + productID
+    return rdb.HGetAll(ctx, key).Result()
+}
+
+func getProductField(ctx context.Context, rdb *redis.Client, productID, field string) (string, error) {
+    key := "product:" + productID
+    return rdb.HGet(ctx, key, field).Result()
+}
+
+// Example usage
+func main() {
+    ctx := context.Background()
+    rdb := redis.NewClient(&redis.Options{
+        Addr: "localhost:6379",
+    })
+
+    product := map[string]string{
+        "name":  "Laptop",
+        "price": "999.99",
+        "stock": "50",
+        "category": "Electronics",
+    }
+
+    storeProduct(ctx, rdb, "12345", product)
+    
+    // Get all product data
+    fullProduct, _ := getProduct(ctx, rdb, "12345")
+    
+    // Get just the price
+    price, _ := getProductField(ctx, rdb, "12345", "price")
+}
+```
+
+### Hash vs String for Structured Data
+
+**Use Hash when:**
+- You need to update individual fields without replacing the entire object
+- You want to retrieve only specific fields (more efficient than parsing JSON)
+- You have many small fields (better memory efficiency)
+- You need atomic field updates
+
+**Use String (JSON) when:**
+- You always read/write the entire object
+- You need complex nested structures
+- You want to leverage JSON validation/parsing
+
+**Example Comparison:**
+
+```python
+# Using Hash (better for partial updates)
+cache.hset("user:1001", "age", "31")  # Updates only age field
+age = cache.hget("user:1001", "age")  # Gets only age field
+
+# Using String/JSON (better for full object operations)
+import json
+user = json.loads(cache.get("user:1001"))
+user["age"] = 31
+cache.set("user:1001", json.dumps(user))  # Must replace entire object
+```
+
+### Memory Efficiency
+
+Hash structures are memory-efficient for structured data:
+
+```
+Example: User profile with 10 fields
+- Hash: ~200 bytes (field names + values + overhead)
+- JSON string: ~300 bytes (includes JSON syntax, quotes, etc.)
+
+For 1M user profiles:
+- Hash: ~200 MB
+- JSON: ~300 MB
+- Savings: 33% with hash
+```
+
 ## Session Storage (Redis-compatible)
 
 ```python
@@ -257,7 +461,9 @@ def get_product(product_id):
 - **Session tokens**: 32-256 bytes, 1M+ ops/s sustained
 - **API responses**: 1-10KB JSON, 95%+ cache hit rate
 - **HTML fragments**: 10-50KB, moderate churn
-- **User profiles**: 500B-2KB, high read ratio (20:1)
+- **User profiles**: 500B-2KB, high read ratio (20:1) - **Use Hash for better efficiency**
+- **Configuration objects**: Multiple fields per key - **Use Hash for partial updates**
+- **Product catalogs**: Structured data with many fields - **Use Hash for field-level access**
 - **Rate limit counters**: 1-8 bytes, millions of keys
 
 ### ⚠️ Consider Alternatives
