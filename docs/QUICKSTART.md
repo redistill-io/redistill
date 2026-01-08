@@ -9,6 +9,28 @@ Get Redistill running in 5 minutes.
 - 1GB free RAM
 
 ## Installation
+We recommend Docker for the quick start.
+
+```bash
+# Run with default settings
+docker run -d --name redistill -p 6379:6379 shahidontech/redistill:latest
+```
+
+**macOS (Homebrew):**
+```bash
+brew tap shaikh-shahid/redistill
+brew install redistill
+redistill
+```
+
+**Linux (Binary):**
+```bash
+wget https://github.com/shaikh-shahid/redistill/releases/download/v1.1.2/redistill-1.1.2-x86_64-unknown-linux-musl.tar.gz
+tar -xzf redistill-*.tar.gz
+./redistill
+```
+
+You can also build the project from the source.
 
 ```bash
 # Clone repository

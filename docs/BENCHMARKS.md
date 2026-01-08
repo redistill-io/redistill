@@ -102,13 +102,13 @@ Comprehensive benchmarks on **AWS c7i.8xlarge** (Intel, 32 cores) with optimal c
 
 ### Key Findings
 
-✅ **Redistill Matches or Beats Redis on ALL Workloads:**
+**Redistill Matches or Beats Redis on ALL Workloads:**
 - **GET operations: +74% to +98% faster** (nearly 2x!)
 - **Production SET: +23% faster**
 - **High concurrency SET: +20% faster**
 - **Extreme concurrency SET: Matches Redis exactly**
 
-✅ **Perfect For:**
+**Perfect For:**
 - Read-heavy caching (80-95% reads) - **massive advantage**
 - Session storage, API response caching, rate limiting
 - Production workloads with any concurrency level
@@ -133,10 +133,10 @@ Tested on c7i.8xlarge with `batch_size=256` and `buffer_pool_size=2048`:
 
 ### Key Optimizations (v1.0.4)
 
-- ✅ **2048 shards:** 8x less contention (31 ops/shard vs 250 ops/shard with 256 shards)
-- ✅ **Batched atomic counters:** 256x fewer atomic operations
-- ✅ **Probabilistic LRU:** 90% skip rate on timestamp updates
-- ✅ **Result:** Matches Redis at extreme concurrency, dominates on GETs
+- **2048 shards:** 8x less contention (31 ops/shard vs 250 ops/shard with 256 shards)
+- **Batched atomic counters:** 256x fewer atomic operations
+- **Probabilistic LRU:** 90% skip rate on timestamp updates
+- **Result:** Matches Redis at extreme concurrency, dominates on GETs
 
 ### Tuning Principles
 
@@ -144,7 +144,7 @@ Tested on c7i.8xlarge with `batch_size=256` and `buffer_pool_size=2048`:
 - **`batch_size`**: Match your pipeline depth (256 optimal for P > 64)
 - **`buffer_pool_size`**: 2048 for best tail latency
 
-> 💡 For detailed tuning guidance, see [Performance Tuning Guide](PERFORMANCE_TUNING.md).
+> For detailed tuning guidance, see [Performance Tuning Guide](PERFORMANCE_TUNING.md).
 
 ## Benchmark Methodology
 

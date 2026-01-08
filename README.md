@@ -314,6 +314,9 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `EXISTS key [key ...]` - Check existence
 - `MSET key value [key value ...]` - Set multiple keys
 - `MGET key [key ...]` - Get multiple keys
+- `HSET key field value [field value ...]` - Set Hash keys
+- `HGET key field` - Get key value
+- `HGETALL key` - Get all key-value pairs from hash
 - `SCAN cursor [MATCH pattern] [COUNT count]` - Iterate keys (non-blocking)
 
 **Counter Commands:**
@@ -341,7 +344,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `FLUSHDB` / `FLUSHALL` - Clear all data
 - `AUTH password` - Authenticate
 
-> 📖 See [Features Documentation](docs/FEATURES.md) for complete command list.
+> See [Features Documentation](docs/FEATURES.md) for complete command list.
 
 ## Production Features
 
@@ -369,7 +372,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - HTTP health endpoint (JSON) at port 8080
 - Real-time metrics tracking (uptime, ops/sec, memory)
 
-> 📖 See [Production Guide](docs/PRODUCTION_GUIDE.md) for deployment best practices.
+> See [Production Guide](docs/PRODUCTION_GUIDE.md) for deployment best practices.
 
 ## Client Libraries
 
