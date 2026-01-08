@@ -57,10 +57,18 @@ pub fn return_buffer(mut buf: Vec<u8>) {
     // Otherwise drop the buffer (too large or pool is full enough)
 }
 
+// ==================== Entry Value Types ====================
+
+#[derive(Clone)]
+pub enum EntryValue {
+    String(Bytes),
+    Hash(Arc<DashMap<Bytes, Bytes>>),
+}
+
 // ==================== Entry ====================
 
 pub struct Entry {
-    pub value: Bytes,
+    pub value: EntryValue,
     pub expiry: Option<u64>,
     pub last_accessed: AtomicU32,
 }
@@ -122,13 +130,13 @@ impl ShardedStore {
         let old_entry = shard.insert(
             key,
             Entry {
-                value,
+                value: EntryValue::String(value),
                 expiry,
                 last_accessed: AtomicU32::new(timestamp),
             },
         );
 
-        old_entry.map(|e| entry_size(key_len, e.value.len()))
+        old_entry.map(|e| calculate_entry_size(key_len, &e.value))
     }
 
     #[inline(always)]
@@ -139,7 +147,7 @@ impl ShardedStore {
             if let Some(expiry) = entry.expiry && now >= expiry {
                 return None;
             }
-            return Some(entry_size(key.len(), entry.value.len()));
+            return Some(calculate_entry_size(key.len(), &entry.value));
         }
         None
     }
@@ -155,19 +163,23 @@ impl ShardedStore {
                 // Extract info before dropping to avoid race condition
                 let key_bytes = Bytes::copy_from_slice(key);
                 let key_len = key_bytes.len();
-                let value_len = entry.value.len();
+                let entry_size = calculate_entry_size(key_len, &entry.value);
                 drop(entry);
 
                 // Atomic remove - only one thread can succeed
                 if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                    let size = entry_size(key_len, value_len);
-                    MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                 }
                 return None;
             }
 
             maybe_update_access_time(&entry);
-            return Some(entry.value.clone());
+            // Only return value if it's a string
+            if let EntryValue::String(ref val) = entry.value {
+                return Some(val.clone());
+            }
+            // If it's a hash, return None (type mismatch)
+            return None;
         }
         None
     }
@@ -181,7 +193,7 @@ impl ShardedStore {
                 // Always decrement memory if key was removed, regardless of expiry
                 // (expired keys still consume memory until removed)
                 if CONFIG.memory.max_memory > 0 {
-                    let size = entry_size(key.len(), entry.value.len());
+                    let size = calculate_entry_size(key.len(), &entry.value);
                     MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
                 }
                 // Only count as deleted if not expired (Redis semantics)
@@ -309,6 +321,153 @@ impl ShardedStore {
             shard.clear();
         }
     }
+
+    // ==================== Hash Operations ====================
+
+    /// Set one or more field-value pairs in a hash
+    /// Returns the number of fields that were newly set (not updated)
+    pub fn hset(&self, key: Bytes, fields: &[(Bytes, Bytes)], now: u64) -> Result<usize, &'static str> {
+        let key_len = key.len();
+        let shard = &self.shards[self.hash(&key)];
+
+        let timestamp = if fastrand::u32(..).is_multiple_of(10) {
+            get_uptime_seconds()
+        } else {
+            0
+        };
+
+        // Check if key exists and validate type
+        let (hash_map, old_size, preserved_expiry) = if let Some(entry) = shard.get(&key) {
+            // Check if expired
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                // Expired, create new hash
+                (Arc::new(DashMap::new()), None, None)
+            } else {
+                // Check type and extract info
+                match &entry.value {
+                    EntryValue::Hash(hash) => {
+                        // CRITICAL: Clone the contents, not just the Arc reference
+                        // This ensures we don't modify the original hash_map while calculating sizes
+                        let size = calculate_entry_size(key_len, &entry.value);
+                        let new_hash_map = Arc::new(DashMap::new());
+                        // Copy all existing fields to the new hash map
+                        for hash_entry in hash.iter() {
+                            new_hash_map.insert(hash_entry.key().clone(), hash_entry.value().clone());
+                        }
+                        (new_hash_map, Some(size), entry.expiry)
+                    }
+                    EntryValue::String(_) => {
+                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                    }
+                }
+            }
+        } else {
+            // Key doesn't exist, create new hash
+            (Arc::new(DashMap::new()), None, None)
+        };
+
+        // Set fields and count new ones
+        let mut new_count = 0;
+        for (field, value) in fields {
+            if hash_map.insert(field.clone(), value.clone()).is_none() {
+                new_count += 1;
+            }
+        }
+
+        // Insert or update entry
+        let new_entry = Entry {
+            value: EntryValue::Hash(hash_map.clone()),
+            expiry: preserved_expiry, // Preserve expiry from old entry if it exists
+            last_accessed: AtomicU32::new(timestamp),
+        };
+
+        let removed_entry = shard.insert(key, new_entry);
+        let new_size = calculate_entry_size(key_len, &EntryValue::Hash(hash_map));
+
+        // Update memory tracking
+        if CONFIG.memory.max_memory > 0 {
+            if let Some(old_sz) = old_size {
+                MEMORY_USED.fetch_sub(old_sz as u64, Ordering::Relaxed);
+            } else if let Some(old) = removed_entry {
+                // Fallback: calculate from removed entry if old_size wasn't set
+                MEMORY_USED.fetch_sub(calculate_entry_size(key_len, &old.value) as u64, Ordering::Relaxed);
+            }
+            MEMORY_USED.fetch_add(new_size as u64, Ordering::Relaxed);
+        }
+
+        Ok(new_count)
+    }
+
+    /// Get a field value from a hash
+    pub fn hget(&self, key: &[u8], field: &[u8], now: u64) -> Result<Option<Bytes>, &'static str> {
+        let shard = &self.shards[self.hash(key)];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                // Expired - remove it
+                let key_bytes = Bytes::copy_from_slice(key);
+                let key_len = key_bytes.len();
+                let entry_size = calculate_entry_size(key_len, &entry.value);
+                drop(entry);
+
+                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+                }
+                return Ok(None);
+            }
+
+            maybe_update_access_time(&entry);
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    Ok(hash_map.get(field).map(|v| v.value().clone()))
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all field-value pairs from a hash
+    pub fn hgetall(&self, key: &[u8], now: u64) -> Result<Vec<Bytes>, &'static str> {
+        let shard = &self.shards[self.hash(key)];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                // Expired - remove it
+                let key_bytes = Bytes::copy_from_slice(key);
+                let key_len = key_bytes.len();
+                let entry_size = calculate_entry_size(key_len, &entry.value);
+                drop(entry);
+
+                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+                }
+                return Ok(Vec::new());
+            }
+
+            maybe_update_access_time(&entry);
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    let mut result = Vec::new();
+                    for entry in hash_map.iter() {
+                        result.push(entry.key().clone());
+                        result.push(entry.value().clone());
+                    }
+                    Ok(result)
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
 }
 
 // ==================== Helper Functions ====================
@@ -329,6 +488,22 @@ pub fn get_uptime_seconds() -> u32 {
 #[inline(always)]
 pub fn entry_size(key_len: usize, value_len: usize) -> usize {
     key_len + value_len + 64
+}
+
+#[inline(always)]
+pub fn calculate_entry_size(key_len: usize, value: &EntryValue) -> usize {
+    match value {
+        EntryValue::String(bytes) => entry_size(key_len, bytes.len()),
+        EntryValue::Hash(hash_map) => {
+            // Base overhead for hash entry
+            let mut size = key_len + 64 + 128; // Base entry + DashMap overhead
+            // Add size of all field keys and values
+            for entry in hash_map.iter() {
+                size += entry.key().len() + entry.value().len();
+            }
+            size
+        }
+    }
 }
 
 #[inline(always)]
@@ -418,7 +593,7 @@ fn evict_lru(store: &ShardedStore) -> usize {
         let key_len = key.len();
         let shard = &store.shards[oldest_shard_idx];
         if let Some((_, entry)) = shard.remove(&key) {
-            let size = entry_size(key_len, entry.value.len());
+            let size = calculate_entry_size(key_len, &entry.value);
             MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
             EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
             return size;
@@ -445,7 +620,7 @@ fn evict_random(store: &ShardedStore) -> usize {
         drop(entry);
 
         if let Some((_, entry)) = shard.remove(&key) {
-            let size = entry_size(key_len, entry.value.len());
+            let size = calculate_entry_size(key_len, &entry.value);
             MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
             EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
             return size;
@@ -478,15 +653,14 @@ pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
             // Extract info before dropping to avoid race condition
             let key = entry.key().clone();
             let key_len = key.len();
-            let value_len = entry.value().value.len();
+            let entry_size = calculate_entry_size(key_len, &entry.value().value);
             drop(entry);
 
             // Atomic remove - only one thread can succeed
             if shard.remove(key.as_ref()).is_some() {
                 expired_count += 1;
                 if CONFIG.memory.max_memory > 0 {
-                    let size = entry_size(key_len, value_len);
-                    MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                 }
             }
         }

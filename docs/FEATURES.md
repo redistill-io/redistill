@@ -48,6 +48,27 @@
 - `INCRBY key increment` - Increment integer value by specified amount
 - `DECRBY key decrement` - Decrement integer value by specified amount
 
+#### Hash Commands
+- `HSET key field value [field value ...]` - Set one or more field-value pairs in a hash
+  - Returns: Integer count of fields that were newly set (1 if new, 0 if updated)
+  - Creates hash if key doesn't exist
+  - Updates existing fields if they already exist
+  - Example: `HSET user:1001 name "John" age "30" city "NYC"` returns `3`
+- `HGET key field` - Get value of a field in a hash
+  - Returns: Bulk string value or null if field/key doesn't exist
+  - Example: `HGET user:1001 name` returns `"John"`
+- `HGETALL key` - Get all field-value pairs from a hash
+  - Returns: Array of alternating field-value pairs `[field1, value1, field2, value2, ...]`
+  - Returns empty array if key doesn't exist or is empty hash
+  - Example: `HGETALL user:1001` returns `["name", "John", "age", "30", "city", "NYC"]`
+  - **Note**: Field order is not guaranteed (matches Redis behavior)
+
+**Hash Features:**
+- Thread-safe concurrent access to hash fields
+- Memory-efficient storage with automatic cleanup
+- Full persistence support (saved/loaded in snapshots)
+- Type safety: Operations return `WRONGTYPE` error if key exists as different type
+
 #### TTL Commands
 - `EXPIRE key seconds` - Set timeout on existing key
 - `TTL key` - Get remaining time to live in seconds (-1 = no TTL, -2 = key doesn't exist)
@@ -191,9 +212,11 @@ The following Redis features are intentionally not implemented:
 
 ### Data Structures
 
-**Excluded**: Lists, Sets, Sorted Sets, Hashes, Streams, Bitmaps, HyperLogLog
+**Excluded**: Lists, Sets, Sorted Sets, Streams, Bitmaps, HyperLogLog
 
-**Rationale**: Core key-value operations provide maximum performance. Advanced data structures add complexity and overhead.
+**Rationale**: Core key-value operations and hashes provide maximum performance. Additional data structures add complexity and overhead.
+
+**Note**: Hash data structure is now implemented (HSET, HGET, HGETALL) for storing field-value pairs within a key.
 
 ### Pub/Sub
 
@@ -238,7 +261,7 @@ Potential additions based on user feedback:
 - Clustering support (hash slots, node discovery)
 - Optional persistence mode (behind feature flag)
 - Replication support
-- Basic hash operations (HSET, HGET, HGETALL)
+- Additional hash operations (HDEL, HKEYS, HVALS, HLEN, HEXISTS, HMSET, HMGET)
 
 **Note**: New features will only be added if they don't compromise core performance objectives.
 
@@ -282,7 +305,7 @@ Potential additions based on user feedback:
 | Protocol | RESP | RESP |
 | Throughput | 9.07M ops/s | 2.03M ops/s |
 | Latency (p50) | 0.48ms | 2.38ms |
-| Data types | String + Counters | String, List, Set, Hash, etc. |
+| Data types | String + Counters + Hash | String, List, Set, Hash, etc. |
 | Counter commands | INCR, DECR, INCRBY, DECRBY | Full set |
 | TTL commands | EXPIRE, TTL, PTTL, PERSIST | Full set |
 | Bulk operations | MGET, MSET | Full set |

@@ -38,7 +38,7 @@ use server::{
 };
 use store::{
     ACTIVE_CONNECTIONS, EVICTED_KEYS, MEMORY_USED, REJECTED_CONNECTIONS, ShardedStore,
-    TOTAL_COMMANDS, TOTAL_CONNECTIONS, entry_size, evict_if_needed, expire_random_keys,
+    TOTAL_COMMANDS, TOTAL_CONNECTIONS, EntryValue, entry_size, evict_if_needed, expire_random_keys,
     get_timestamp,
 };
 
@@ -191,6 +191,14 @@ fn execute_command(
                     handle_scan(store, command, writer, now);
                     return;
                 }
+                if &lower == b"hset" {
+                    handle_hset(store, command, writer, now);
+                    return;
+                }
+                if &lower == b"hget" {
+                    handle_hget(store, command, writer, now);
+                    return;
+                }
             }
         }
         6 => {
@@ -208,14 +216,25 @@ fn execute_command(
                     writer.write_error(b"persistence is disabled");
                     return;
                 }
-                if SAVE_IN_PROGRESS.load(Ordering::Relaxed) {
+                // Atomically check and set the flag to prevent race conditions
+                if SAVE_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                     writer.write_error(b"Background save already in progress");
                     return;
                 }
                 let store_clone = store.clone();
                 let path = CONFIG.persistence.snapshot_path.clone();
                 std::thread::spawn(move || {
-                    let _ = save_snapshot_sync(&store_clone, &path);
+                    // save_snapshot_sync expects to set SAVE_IN_PROGRESS itself, but we already set it
+                    // So we temporarily clear it, let save_snapshot_sync set it, then it will clear on completion
+                    SAVE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                    match save_snapshot_sync(&store_clone, &path) {
+                        Ok(count) => {
+                            eprintln!("Background snapshot saved: {} keys", count);
+                        }
+                        Err(e) => {
+                            eprintln!("Background snapshot failed: {}", e);
+                        }
+                    }
                 });
                 writer.write_simple_string(b"Background saving started");
                 return;
@@ -262,7 +281,7 @@ fn execute_command(
                             let (key, val) = entry.pair();
                             // Only count non-expired keys (expired keys already have memory freed)
                             if val.expiry.is_none_or(|exp| now < exp) {
-                                actual_memory += entry_size(key.len(), val.value.len()) as u64;
+                                actual_memory += store::calculate_entry_size(key.len(), &val.value) as u64;
                             }
                         }
                     }
@@ -301,6 +320,10 @@ fn execute_command(
                     handle_persist(store, command, writer, now);
                     return;
                 }
+                if &lower == b"hgetall" {
+                    handle_hgetall(store, command, writer, now);
+                    return;
+                }
             }
         }
         8 => {
@@ -329,7 +352,7 @@ fn execute_command(
                             let (key, val) = entry.pair();
                             // Only count non-expired keys (expired keys already have memory freed)
                             if val.expiry.is_none_or(|exp| now < exp) {
-                                actual_memory += entry_size(key.len(), val.value.len()) as u64;
+                                actual_memory += store::calculate_entry_size(key.len(), &val.value) as u64;
                             }
                         }
                     }
@@ -457,7 +480,12 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
             {
                 return None;
             }
-            Some(entry.value.clone())
+            // Only return value if it's a string (for GET option)
+            if let EntryValue::String(ref val) = entry.value {
+                Some(val.clone())
+            } else {
+                None // Type mismatch - treat as not found
+            }
         })
     } else {
         None
@@ -518,13 +546,12 @@ fn handle_ttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
                     // Extract info before dropping to avoid race condition
                     let key_bytes = Bytes::copy_from_slice(key);
                     let key_len = key_bytes.len();
-                    let value_len = entry.value.len();
+                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
                     
                     // Atomic remove - only one thread can succeed
                     if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        let size = entry_size(key_len, value_len);
-                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                     }
                     writer.write_signed_integer(-2);
                 } else {
@@ -553,13 +580,12 @@ fn handle_pttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
                     // Extract info before dropping to avoid race condition
                     let key_bytes = Bytes::copy_from_slice(key);
                     let key_len = key_bytes.len();
-                    let value_len = entry.value.len();
+                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
                     
                     // Atomic remove - only one thread can succeed
                     if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        let size = entry_size(key_len, value_len);
-                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                     }
                     writer.write_signed_integer(-2);
                 } else {
@@ -594,21 +620,29 @@ fn handle_incr(
     // Read key once to get value, TTL, and old size atomically
     let (current, existing_ttl, old_size_for_eviction) = match shard.get(key.as_ref()) {
         Some(entry) => {
+            // Only work with string values for INCR/DECR
+            let string_value = match &entry.value {
+                EntryValue::String(bytes) => bytes,
+                EntryValue::Hash(_) => {
+                    writer.write_error(b"WRONGTYPE Operation against a key holding the wrong kind of value");
+                    return;
+                }
+            };
+
             if let Some(expiry) = entry.expiry {
                 if now >= expiry {
                     // Expired - remove it, treat as 0, no TTL to preserve
                     let key_bytes = Bytes::copy_from_slice(key);
                     let key_len = key_bytes.len();
-                    let value_len = entry.value.len();
+                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
                     if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        let size = entry_size(key_len, value_len);
-                        MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                     }
                     (0i64, None, 0)
                 } else {
                     // Not expired - parse value and preserve TTL
-                    let value = match parse_i64(&entry.value) {
+                    let value = match parse_i64(string_value) {
                         Some(v) => v,
                         None => {
                             writer.write_error(b"value is not an integer or out of range");
@@ -616,19 +650,19 @@ fn handle_incr(
                         }
                     };
                     let ttl = Some(expiry.saturating_sub(now));
-                    let old_size = entry_size(key.len(), entry.value.len());
+                    let old_size = store::calculate_entry_size(key.len(), &entry.value);
                     (value, ttl, old_size)
                 }
             } else {
                 // No expiry - parse value, no TTL
-                let value = match parse_i64(&entry.value) {
+                let value = match parse_i64(string_value) {
                     Some(v) => v,
                     None => {
                         writer.write_error(b"value is not an integer or out of range");
                         return;
                     }
                 };
-                let old_size = entry_size(key.len(), entry.value.len());
+                let old_size = store::calculate_entry_size(key.len(), &entry.value);
                 (value, None, old_size)
             }
         }
@@ -879,13 +913,12 @@ fn handle_expire(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrite
             // Extract info before dropping to avoid race condition
             let key_bytes = Bytes::copy_from_slice(key);
             let key_len = key_bytes.len();
-            let value_len = entry.value.len();
+            let entry_size = store::calculate_entry_size(key_len, &entry.value);
             drop(entry);
             
             // Atomic remove - only one thread can succeed
             if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                let size = entry_size(key_len, value_len);
-                MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
             }
             writer.write_integer(0);
             return;
@@ -971,13 +1004,12 @@ fn handle_persist(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrit
                 // Extract info before dropping to avoid race condition
                 let key_bytes = Bytes::copy_from_slice(key);
                 let key_len = key_bytes.len();
-                let value_len = entry.value.len();
+                let entry_size = store::calculate_entry_size(key_len, &entry.value);
                 drop(entry);
                 
                 // Atomic remove - only one thread can succeed
                 if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                    let size = entry_size(key_len, value_len);
-                    MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
                 }
                 writer.write_integer(0);
             } else {
@@ -989,6 +1021,61 @@ fn handle_persist(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrit
         }
     } else {
         writer.write_integer(0);
+    }
+}
+
+#[inline(always)]
+fn handle_hset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+    if command.len() < 4 || (command.len() - 2) % 2 != 0 {
+        writer.write_error(b"wrong number of arguments for 'hset' command");
+        return;
+    }
+
+    let key = command[1].clone();
+    let field_count = (command.len() - 2) / 2;
+    let mut fields = Vec::with_capacity(field_count);
+
+    for i in 0..field_count {
+        fields.push((command[2 + i * 2].clone(), command[3 + i * 2].clone()));
+    }
+
+    match store.hset(key, &fields, now) {
+        Ok(count) => writer.write_integer(count),
+        Err(e) => writer.write_error(e.as_bytes()),
+    }
+}
+
+#[inline(always)]
+fn handle_hget(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+    if command.len() < 3 {
+        writer.write_error(b"wrong number of arguments for 'hget' command");
+        return;
+    }
+
+    let key = &command[1];
+    let field = &command[2];
+
+    match store.hget(key, field, now) {
+        Ok(Some(value)) => writer.write_bulk_string(&value),
+        Ok(None) => writer.write_null(),
+        Err(e) => writer.write_error(e.as_bytes()),
+    }
+}
+
+#[inline(always)]
+fn handle_hgetall(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+    if command.len() < 2 {
+        writer.write_error(b"wrong number of arguments for 'hgetall' command");
+        return;
+    }
+
+    let key = &command[1];
+
+    match store.hgetall(key, now) {
+        Ok(pairs) => {
+            writer.write_array(&pairs);
+        }
+        Err(e) => writer.write_error(e.as_bytes()),
     }
 }
 
