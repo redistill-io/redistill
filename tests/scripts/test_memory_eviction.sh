@@ -27,7 +27,7 @@ echo "Test 1: Fill memory and verify eviction"
 echo "========================================="
 echo "Starting server with 1MB memory limit..."
 
-REDISTILL_CONFIG=redistill-memory-test.toml ./target/release/redistill &
+REDISTILL_CONFIG=redistill-memory-test.toml ../../target/release/redistill &
 SERVER_PID=$!
 sleep 2
 
@@ -66,7 +66,7 @@ eviction_policy = "noeviction"
 EOF
 
 echo "Starting server with noeviction policy..."
-REDISTILL_CONFIG=redistill-memory-test.toml ./target/release/redistill &
+REDISTILL_CONFIG=redistill-memory-test.toml ../../target/release/redistill &
 SERVER_PID=$!
 sleep 2
 
