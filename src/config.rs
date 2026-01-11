@@ -67,6 +67,10 @@ pub struct MemoryConfig {
     pub eviction_policy: String,
     #[serde(default = "default_eviction_sample_size")]
     pub eviction_sample_size: usize,
+    #[serde(default = "default_s3fifo_small_ratio")]
+    pub s3fifo_small_ratio: f64,
+    #[serde(default = "default_s3fifo_ghost_ratio")]
+    pub s3fifo_ghost_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +145,12 @@ fn default_eviction_policy() -> String {
 fn default_eviction_sample_size() -> usize {
     5
 }
+fn default_s3fifo_small_ratio() -> f64 {
+    0.1
+}
+fn default_s3fifo_ghost_ratio() -> f64 {
+    0.1
+}
 fn default_snapshot_path() -> String {
     "redistill.rdb".to_string()
 }
@@ -191,6 +201,8 @@ impl Default for MemoryConfig {
             max_memory: 0,
             eviction_policy: default_eviction_policy(),
             eviction_sample_size: default_eviction_sample_size(),
+            s3fifo_small_ratio: default_s3fifo_small_ratio(),
+            s3fifo_ghost_ratio: default_s3fifo_ghost_ratio(),
         }
     }
 }
@@ -214,6 +226,7 @@ pub enum EvictionPolicy {
     #[default]
     AllKeysLru,
     AllKeysRandom,
+    AllKeysS3Fifo,
 }
 
 impl FromStr for EvictionPolicy {
@@ -223,6 +236,7 @@ impl FromStr for EvictionPolicy {
         Ok(match s.to_lowercase().as_str() {
             "allkeys-lru" => EvictionPolicy::AllKeysLru,
             "allkeys-random" => EvictionPolicy::AllKeysRandom,
+            "allkeys-s3fifo" => EvictionPolicy::AllKeysS3Fifo,
             "noeviction" => EvictionPolicy::NoEviction,
             _ => EvictionPolicy::AllKeysLru,
         })
@@ -235,6 +249,7 @@ impl EvictionPolicy {
             EvictionPolicy::NoEviction => "noeviction",
             EvictionPolicy::AllKeysLru => "allkeys-lru",
             EvictionPolicy::AllKeysRandom => "allkeys-random",
+            EvictionPolicy::AllKeysS3Fifo => "allkeys-s3fifo",
         }
     }
 }

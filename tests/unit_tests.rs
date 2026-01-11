@@ -278,6 +278,10 @@ fn test_eviction_policy_from_str() {
         "noeviction".parse::<EvictionPolicy>().unwrap(),
         EvictionPolicy::NoEviction
     );
+    assert_eq!(
+        "allkeys-s3fifo".parse::<EvictionPolicy>().unwrap(),
+        EvictionPolicy::AllKeysS3Fifo
+    );
     // Default on unknown
     assert_eq!(
         "unknown".parse::<EvictionPolicy>().unwrap(),
@@ -289,6 +293,7 @@ fn test_eviction_policy_from_str() {
 fn test_eviction_policy_as_str() {
     assert_eq!(EvictionPolicy::AllKeysLru.as_str(), "allkeys-lru");
     assert_eq!(EvictionPolicy::AllKeysRandom.as_str(), "allkeys-random");
+    assert_eq!(EvictionPolicy::AllKeysS3Fifo.as_str(), "allkeys-s3fifo");
     assert_eq!(EvictionPolicy::NoEviction.as_str(), "noeviction");
 }
 
@@ -528,12 +533,14 @@ fn test_shard_distribution() {
 
 #[test]
 fn test_entry_clone() {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
     let entry1 = Entry {
         value: Bytes::from("test"),
         expiry: Some(12345),
         last_accessed: AtomicU32::new(100),
+        queue_type: AtomicU8::new(0),
+        access_count: AtomicU8::new(0),
     };
 
     let entry2 = entry1.clone();

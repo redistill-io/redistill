@@ -45,6 +45,7 @@ max_memory = 0                  # Maximum memory in bytes (0 = unlimited)
 eviction_policy = "allkeys-lru"   # Policy when memory limit reached:
                                   #   - allkeys-lru: Evict least recently used keys
                                   #   - allkeys-random: Evict random keys
+                                  #   - allkeys-s3fifo: S3-FIFO algorithm (better hit rates)
                                   #   - noeviction: Return errors, don't evict
 eviction_sample_size = 5          # Number of keys to sample for eviction (higher = better decisions)
 

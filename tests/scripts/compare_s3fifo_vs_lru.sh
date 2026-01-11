@@ -23,13 +23,6 @@ cleanup() {
 }
 
 trap cleanup EXIT
-
-# Build if needed
-if [ ! -f ../../target/release/redistill ]; then
-    echo "Building redistill..."
-    cargo build --release 2>/dev/null
-fi
-
 # Test configuration
 MEMORY_LIMIT=1048576  # 1MB
 PORT_LRU=6379

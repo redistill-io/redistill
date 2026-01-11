@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::CONFIG;
@@ -262,6 +262,8 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
                 value: entry_value,
                 expiry: ttl.map(|t| now + t),
                 last_accessed: AtomicU32::new(0),
+                queue_type: AtomicU8::new(0),
+                access_count: AtomicU8::new(0),
             },
         );
 

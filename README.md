@@ -301,7 +301,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 **Quick Tips:**
 - `num_shards`: 2048 for balanced, 4096 for max GET performance
 - `max_memory`: Set based on available RAM (0 = unlimited)
-- `eviction_policy`: "allkeys-lru", "allkeys-random", or "noeviction"
+- `eviction_policy`: "allkeys-lru", "allkeys-random", "allkeys-s3fifo", or "noeviction"
 
 > 📖 See [Configuration Reference](docs/CONFIG.md) for all options and [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) for optimization.
 

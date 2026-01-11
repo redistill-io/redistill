@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "redistill"
-version = "1.2.5"
+version = "1.2.6"
 dependencies = [
  "ahash",
  "bincode",
