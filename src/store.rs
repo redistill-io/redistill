@@ -125,6 +125,9 @@ pub struct S3FifoQueues {
     main_queue: VecDeque<Bytes>,        // Keys in Main queue
     ghost_queue: VecDeque<GhostEntry>,  // Metadata only
     ghost_set: ahash::AHashSet<u64>,    // Fast lookup for ghost entries
+    // HashSets for O(1) membership check before O(n) removal
+    small_set: ahash::AHashSet<Bytes>,  // Fast lookup for Small queue
+    main_set: ahash::AHashSet<Bytes>,   // Fast lookup for Main queue
     small_capacity: usize,
     main_capacity: usize,
     ghost_capacity: usize,
@@ -137,10 +140,77 @@ impl S3FifoQueues {
             main_queue: VecDeque::with_capacity(main_capacity),
             ghost_queue: VecDeque::with_capacity(ghost_capacity),
             ghost_set: ahash::AHashSet::with_capacity(ghost_capacity),
+            small_set: ahash::AHashSet::with_capacity(small_capacity),
+            main_set: ahash::AHashSet::with_capacity(main_capacity),
             small_capacity,
             main_capacity,
             ghost_capacity,
         }
+    }
+    
+    // Optimized removal: O(1) check + O(n) removal only if needed
+    fn remove_from_small(&mut self, key: &Bytes) -> bool {
+        if self.small_set.remove(key) {
+            // Only do O(n) retain if key was actually in set
+            self.small_queue.retain(|k| k != key);
+            true
+        } else {
+            false
+        }
+    }
+    
+    fn remove_from_main(&mut self, key: &Bytes) -> bool {
+        if self.main_set.remove(key) {
+            // Only do O(n) retain if key was actually in set
+            self.main_queue.retain(|k| k != key);
+            true
+        } else {
+            false
+        }
+    }
+    
+    // Optimized: Check if key is already at tail (common case for reinsertion)
+    fn is_main_tail(&self, key: &Bytes) -> bool {
+        self.main_queue.back().map_or(false, |k| k == key)
+    }
+    
+    // Optimized reinsertion: Skip if already at tail, otherwise remove and reinsert
+    fn reinsert_main_tail(&mut self, key: Bytes) {
+        // Fast path: already at tail, nothing to do
+        if self.is_main_tail(&key) {
+            return;
+        }
+        // Slow path: remove and reinsert
+        if self.main_set.contains(&key) {
+            self.remove_from_main(&key);
+        }
+        self.add_to_main(key);
+    }
+    
+    fn add_to_small(&mut self, key: Bytes) {
+        // Remove oldest if at capacity
+        while self.small_queue.len() >= self.small_capacity {
+            if let Some(oldest) = self.small_queue.pop_front() {
+                self.small_set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.small_set.insert(key.clone());
+        self.small_queue.push_back(key);
+    }
+    
+    fn add_to_main(&mut self, key: Bytes) {
+        // Remove oldest if at capacity
+        while self.main_queue.len() >= self.main_capacity {
+            if let Some(oldest) = self.main_queue.pop_front() {
+                self.main_set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.main_set.insert(key.clone());
+        self.main_queue.push_back(key);
     }
 
     fn is_in_ghost(&self, key_hash: u64) -> bool {
@@ -254,10 +324,10 @@ impl ShardedStore {
                 
                 match old_queue_type {
                     QueueType::Small => {
-                        queues_guard.small_queue.retain(|k| k != &key);
+                        queues_guard.remove_from_small(&key);
                     }
                     QueueType::Main => {
-                        queues_guard.main_queue.retain(|k| k != &key);
+                        queues_guard.remove_from_main(&key);
                     }
                 }
                 drop(queues_guard);
@@ -368,16 +438,9 @@ impl ShardedStore {
                             let queues = &self.s3fifo_queues[shard_idx];
                             let mut queues_guard = queues.write().unwrap();
                             
-                            // Remove from Small queue
-                            queues_guard.small_queue.retain(|k| k != &key_bytes);
-                            
-                            // Add to Main queue
-                            while queues_guard.main_queue.len() >= queues_guard.main_capacity {
-                                if let Some(_) = queues_guard.main_queue.pop_front() {
-                                    break;
-                                }
-                            }
-                            queues_guard.main_queue.push_back(key_bytes.clone());
+                            // Remove from Small queue and add to Main
+                            queues_guard.remove_from_small(&key_bytes);
+                            queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
                             
                             // Update entry queue type
@@ -385,15 +448,10 @@ impl ShardedStore {
                         }
                     }
                     QueueType::Main => {
-                        // Reinsert at tail to maintain FIFO order
+                        // Reinsert at tail to maintain FIFO order (optimized: skip if already at tail)
                         let queues = &self.s3fifo_queues[shard_idx];
                         let mut queues_guard = queues.write().unwrap();
-                        
-                        // Remove from current position
-                        queues_guard.main_queue.retain(|k| k != &key_bytes);
-                        
-                        // Add to tail
-                        queues_guard.main_queue.push_back(key_bytes);
+                        queues_guard.reinsert_main_tail(key_bytes);
                         drop(queues_guard);
                     }
                 }
@@ -426,10 +484,10 @@ impl ShardedStore {
                     
                     match queue_type {
                         QueueType::Small => {
-                            queues_guard.small_queue.retain(|k| k != key);
+                            queues_guard.remove_from_small(key);
                         }
                         QueueType::Main => {
-                            queues_guard.main_queue.retain(|k| k != key);
+                            queues_guard.remove_from_main(key);
                         }
                     }
                     drop(queues_guard);
@@ -596,10 +654,10 @@ impl ShardedStore {
                 
                 match old_queue_type {
                     QueueType::Small => {
-                        queues_guard.small_queue.retain(|k| k != &key);
+                        queues_guard.remove_from_small(&key);
                     }
                     QueueType::Main => {
-                        queues_guard.main_queue.retain(|k| k != &key);
+                        queues_guard.remove_from_main(&key);
                     }
                 }
                 drop(queues_guard);
@@ -656,21 +714,11 @@ impl ShardedStore {
             let qtype = if queues_guard.is_in_ghost(key_hash) {
                 // Found in Ghost - insert to Main queue
                 queues_guard.remove_from_ghost(key_hash);
-                while queues_guard.main_queue.len() >= queues_guard.main_capacity {
-                    if let Some(_) = queues_guard.main_queue.pop_front() {
-                        break;
-                    }
-                }
-                queues_guard.main_queue.push_back(key.clone());
+                queues_guard.add_to_main(key.clone());
                 QueueType::Main
             } else {
                 // Not in Ghost - insert to Small queue
-                while queues_guard.small_queue.len() >= queues_guard.small_capacity {
-                    if let Some(_) = queues_guard.small_queue.pop_front() {
-                        break;
-                    }
-                }
-                queues_guard.small_queue.push_back(key.clone());
+                queues_guard.add_to_small(key.clone());
                 QueueType::Small
             };
             drop(queues_guard);
@@ -738,13 +786,8 @@ impl ShardedStore {
                         if access_count > 1 {
                             let queues = &self.s3fifo_queues[shard_idx];
                             let mut queues_guard = queues.write().unwrap();
-                            queues_guard.small_queue.retain(|k| k != &key_bytes);
-                            while queues_guard.main_queue.len() >= queues_guard.main_capacity {
-                                if let Some(_) = queues_guard.main_queue.pop_front() {
-                                    break;
-                                }
-                            }
-                            queues_guard.main_queue.push_back(key_bytes.clone());
+                            queues_guard.remove_from_small(&key_bytes);
+                            queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
                             entry.queue_type.store(QueueType::Main as u8, Ordering::Relaxed);
                         }
@@ -752,8 +795,7 @@ impl ShardedStore {
                     QueueType::Main => {
                         let queues = &self.s3fifo_queues[shard_idx];
                         let mut queues_guard = queues.write().unwrap();
-                        queues_guard.main_queue.retain(|k| k != &key_bytes);
-                        queues_guard.main_queue.push_back(key_bytes);
+                        queues_guard.reinsert_main_tail(key_bytes);
                         drop(queues_guard);
                     }
                 }
@@ -805,13 +847,8 @@ impl ShardedStore {
                         if access_count > 1 {
                             let queues = &self.s3fifo_queues[shard_idx];
                             let mut queues_guard = queues.write().unwrap();
-                            queues_guard.small_queue.retain(|k| k != &key_bytes);
-                            while queues_guard.main_queue.len() >= queues_guard.main_capacity {
-                                if let Some(_) = queues_guard.main_queue.pop_front() {
-                                    break;
-                                }
-                            }
-                            queues_guard.main_queue.push_back(key_bytes.clone());
+                            queues_guard.remove_from_small(&key_bytes);
+                            queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
                             entry.queue_type.store(QueueType::Main as u8, Ordering::Relaxed);
                         }
@@ -819,8 +856,7 @@ impl ShardedStore {
                     QueueType::Main => {
                         let queues = &self.s3fifo_queues[shard_idx];
                         let mut queues_guard = queues.write().unwrap();
-                        queues_guard.main_queue.retain(|k| k != &key_bytes);
-                        queues_guard.main_queue.push_back(key_bytes);
+                        queues_guard.reinsert_main_tail(key_bytes);
                         drop(queues_guard);
                     }
                 }
