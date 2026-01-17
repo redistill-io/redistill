@@ -85,7 +85,7 @@ save_on_shutdown = true
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `max_memory` | integer | 0 | Maximum memory in bytes (0 = unlimited) |
-| `eviction_policy` | string | "allkeys-lru" | Eviction policy: allkeys-lru, allkeys-random, noeviction |
+| `eviction_policy` | string | "allkeys-lru" | Eviction policy: allkeys-lru, allkeys-random, allkeys-s3fifo, noeviction |
 | `eviction_sample_size` | integer | 5 | Number of keys sampled for eviction (higher = better, slower) |
 
 ### Logging Configuration
@@ -305,6 +305,13 @@ max_memory = (10GB * 0.8) - 1GB = 7GB = 7516192768
 - Evicts random keys
 - Faster than LRU
 - Use when all keys have equal importance
+
+**allkeys-s3fifo**:
+- Uses S3-FIFO (Simple and Scalable caching with three Static FIFO queues) algorithm
+- Up to 72% lower miss ratios than LRU
+- Lock-free operations for high throughput
+- Best for workloads with many one-hit wonders
+- Uses three queues: Small (10%), Main (90%), and Ghost (metadata)
 
 **noeviction**:
 - Returns error when memory full

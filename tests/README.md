@@ -53,6 +53,12 @@ All unit tests are in `tests/unit_tests.rs` to keep them separate from `main.rs`
 - TLS/SSL connection tests
 - Multi-client scenario tests
 
+### S3-FIFO Tests (`tests/scripts/test_s3fifo.sh`)
+- S3-FIFO eviction algorithm tests
+- Small queue behavior (one-hit wonders)
+- Main queue promotion (popular items)
+- Ghost queue functionality
+
 ## Test Certificates
 
 The `certs/` directory contains self-signed certificates for testing TLS:

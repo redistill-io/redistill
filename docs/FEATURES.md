@@ -109,6 +109,7 @@
 **Eviction Policies**:
 - **allkeys-lru**: Least Recently Used eviction
 - **allkeys-random**: Random key eviction
+- **allkeys-s3fifo**: S3-FIFO algorithm (up to 72% lower miss ratios than LRU)
 - **noeviction**: Reject writes when full
 
 **Monitoring**:
@@ -314,7 +315,7 @@ Potential additions based on user feedback:
 | Persistence | None | AOF, RDB |
 | Replication | None | Master-replica |
 | Clustering | None | Redis Cluster |
-| Memory management | LRU eviction | Multiple policies |
+| Memory management | LRU, Random, S3-FIFO eviction | Multiple policies |
 | TLS | Yes | Yes |
 | Authentication | Password | Password, ACL |
 | Use case | High-performance cache | General purpose |

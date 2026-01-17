@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::hash::Hasher;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ==================== Configuration Structures ====================
@@ -189,6 +189,7 @@ pub enum EvictionPolicy {
     #[default]
     AllKeysLru,
     AllKeysRandom,
+    AllKeysS3Fifo,
 }
 
 impl FromStr for EvictionPolicy {
@@ -198,6 +199,7 @@ impl FromStr for EvictionPolicy {
         Ok(match s.to_lowercase().as_str() {
             "allkeys-lru" => EvictionPolicy::AllKeysLru,
             "allkeys-random" => EvictionPolicy::AllKeysRandom,
+            "allkeys-s3fifo" => EvictionPolicy::AllKeysS3Fifo,
             "noeviction" => EvictionPolicy::NoEviction,
             _ => EvictionPolicy::AllKeysLru, // default
         })
@@ -210,6 +212,7 @@ impl EvictionPolicy {
             EvictionPolicy::NoEviction => "noeviction",
             EvictionPolicy::AllKeysLru => "allkeys-lru",
             EvictionPolicy::AllKeysRandom => "allkeys-random",
+            EvictionPolicy::AllKeysS3Fifo => "allkeys-s3fifo",
         }
     }
 }
@@ -220,6 +223,8 @@ pub struct Entry {
     pub value: Bytes,
     pub expiry: Option<u64>,
     pub last_accessed: AtomicU32,
+    pub queue_type: AtomicU8,
+    pub access_count: AtomicU8,
 }
 
 impl Clone for Entry {
@@ -228,6 +233,8 @@ impl Clone for Entry {
             value: self.value.clone(),
             expiry: self.expiry,
             last_accessed: AtomicU32::new(self.last_accessed.load(Ordering::Relaxed)),
+            queue_type: AtomicU8::new(self.queue_type.load(Ordering::Relaxed)),
+            access_count: AtomicU8::new(self.access_count.load(Ordering::Relaxed)),
         }
     }
 }
@@ -275,6 +282,8 @@ impl ShardedStore {
                 value,
                 expiry,
                 last_accessed: AtomicU32::new(0), // Will be set by get_uptime_seconds() in real usage
+                queue_type: AtomicU8::new(0),
+                access_count: AtomicU8::new(0),
             },
         );
     }
