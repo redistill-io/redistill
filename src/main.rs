@@ -199,6 +199,10 @@ fn execute_command(
                     handle_hget(store, command, writer, now);
                     return;
                 }
+                if &lower == b"hdel" {
+                    handle_hdel(store, command, writer, now);
+                    return;
+                }
             }
         }
         6 => {
@@ -1079,6 +1083,22 @@ fn handle_hgetall(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrit
     }
 }
 
+#[inline(always)]
+fn handle_hdel(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+    if command.len() < 3 {
+        writer.write_error(b"wrong number of arguments for 'hdel' command");
+        return;
+    }
+
+    let key = &command[1];
+    let fields = &command[2..];
+
+    match store.hdel(key, fields, now) {
+        Ok(count) => writer.write_integer(count),
+        Err(e) => writer.write_error(e.as_bytes()),
+    }
+}
+
 // ==================== Connection Handling ====================
 
 async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
@@ -1153,10 +1173,17 @@ async fn main() {
     let _ = *START_TIME;
 
     println!();
-    println!("╔═══════════════════════════════════════════╗");
-    println!("║         Redistill v1.2.5                  ║");
-    println!("║   High-Performance Redis-Compatible KV    ║");
-    println!("╚═══════════════════════════════════════════╝");
+    println!(r" /$$$$$$$                  /$$ /$$             /$$     /$$ /$$ /$$");
+    println!(r"| $$__  $$                | $$|__/            | $$    |__/| $$| $$");
+    println!(r"| $$  \ $$  /$$$$$$   /$$$$$$$ /$$  /$$$$$$$ /$$$$$$   /$$| $$| $$");
+    println!(r"| $$$$$$$/ /$$__  $$ /$$__  $$| $$ /$$_____/|_  $$_/  | $$| $$| $$");
+    println!(r"| $$__  $$| $$$$$$$$| $$  | $$| $$|  $$$$$$   | $$    | $$| $$| $$");
+    println!(r"| $$  \ $$| $$_____/| $$  | $$| $$ \____  $$  | $$ /$$| $$| $$| $$");
+    println!(r"| $$  | $$|  $$$$$$$|  $$$$$$$| $$ /$$$$$$$/  |  $$$$/| $$| $$| $$");
+    println!(r"|__/  |__/ \_______/ \_______/|__/|_______/    \___/  |__/|__/|__/");
+    println!();
+    println!("  High-Performance Redis-Compatible database");
+    println!("  Version: v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("Configuration:");
     println!("   • Shards: {}", config.server.num_shards);

@@ -536,7 +536,7 @@ fn test_entry_clone() {
     use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
     let entry1 = Entry {
-        value: Bytes::from("test"),
+        value: EntryValue::String(Bytes::from("test")),
         expiry: Some(12345),
         last_accessed: AtomicU32::new(100),
         queue_type: AtomicU8::new(0),
@@ -545,7 +545,10 @@ fn test_entry_clone() {
 
     let entry2 = entry1.clone();
 
-    assert_eq!(entry1.value, entry2.value);
+    match (&entry1.value, &entry2.value) {
+        (EntryValue::String(v1), EntryValue::String(v2)) => assert_eq!(v1, v2),
+        _ => panic!("Expected String variant"),
+    }
     assert_eq!(entry1.expiry, entry2.expiry);
     assert_eq!(
         entry1.last_accessed.load(Ordering::Relaxed),
@@ -940,4 +943,380 @@ fn test_rapid_counter_updates() {
     // Final value should be at least 10 (minimum if all races conflict)
     // and at most 1000 (if no races occurred)
     assert!((10..=1000).contains(&final_val));
+}
+
+// ==================== Hash Command Tests ====================
+
+#[test]
+fn test_hset_and_hget_basic() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    let result = store.hset(
+        key.clone(),
+        &[(Bytes::from("field1"), Bytes::from("value1"))],
+        now(),
+    );
+    assert_eq!(result.unwrap(), 1);
+
+    let val = store.hget(&key, b"field1", now()).unwrap();
+    assert_eq!(val, Some(Bytes::from("value1")));
+}
+
+#[test]
+fn test_hset_multiple_fields() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    let result = store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+            (Bytes::from("f3"), Bytes::from("v3")),
+        ],
+        now(),
+    );
+    assert_eq!(result.unwrap(), 3);
+
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), Some(Bytes::from("v1")));
+    assert_eq!(store.hget(&key, b"f2", now()).unwrap(), Some(Bytes::from("v2")));
+    assert_eq!(store.hget(&key, b"f3", now()).unwrap(), Some(Bytes::from("v3")));
+}
+
+#[test]
+fn test_hget_nonexistent_key() {
+    let store = create_test_store();
+
+    let result = store.hget(b"nokey", b"field", now()).unwrap();
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_hget_nonexistent_field() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(key.clone(), &[(Bytes::from("f1"), Bytes::from("v1"))], now()).unwrap();
+
+    let result = store.hget(&key, b"missing_field", now()).unwrap();
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_hgetall_basic() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+        ],
+        now(),
+    ).unwrap();
+
+    let pairs = store.hgetall(&key, now()).unwrap();
+    assert_eq!(pairs.len(), 4); // 2 fields * 2 (key + value)
+
+    // Collect into a set of (field, value) pairs for order-independent comparison
+    let mut field_values: Vec<(Bytes, Bytes)> = Vec::new();
+    for i in (0..pairs.len()).step_by(2) {
+        field_values.push((pairs[i].clone(), pairs[i + 1].clone()));
+    }
+    field_values.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(field_values[0], (Bytes::from("f1"), Bytes::from("v1")));
+    assert_eq!(field_values[1], (Bytes::from("f2"), Bytes::from("v2")));
+}
+
+#[test]
+fn test_hgetall_nonexistent_key() {
+    let store = create_test_store();
+
+    let result = store.hgetall(b"nokey", now()).unwrap();
+    assert!(result.is_empty());
+}
+
+// ==================== HDEL Tests ====================
+
+#[test]
+fn test_hdel_single_field() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+        ],
+        now(),
+    ).unwrap();
+
+    let removed = store.hdel(&key, &[Bytes::from("f1")], now()).unwrap();
+    assert_eq!(removed, 1);
+
+    // f1 should be gone
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), None);
+    // f2 should remain
+    assert_eq!(store.hget(&key, b"f2", now()).unwrap(), Some(Bytes::from("v2")));
+}
+
+#[test]
+fn test_hdel_multiple_fields() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+            (Bytes::from("f3"), Bytes::from("v3")),
+        ],
+        now(),
+    ).unwrap();
+
+    let removed = store.hdel(
+        &key,
+        &[Bytes::from("f1"), Bytes::from("f3")],
+        now(),
+    ).unwrap();
+    assert_eq!(removed, 2);
+
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), None);
+    assert_eq!(store.hget(&key, b"f2", now()).unwrap(), Some(Bytes::from("v2")));
+    assert_eq!(store.hget(&key, b"f3", now()).unwrap(), None);
+}
+
+#[test]
+fn test_hdel_nonexistent_field() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[(Bytes::from("f1"), Bytes::from("v1"))],
+        now(),
+    ).unwrap();
+
+    let removed = store.hdel(&key, &[Bytes::from("nonexistent")], now()).unwrap();
+    assert_eq!(removed, 0);
+
+    // Original field should remain
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), Some(Bytes::from("v1")));
+}
+
+#[test]
+fn test_hdel_mix_existing_and_nonexistent_fields() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+        ],
+        now(),
+    ).unwrap();
+
+    let removed = store.hdel(
+        &key,
+        &[Bytes::from("f1"), Bytes::from("missing1"), Bytes::from("missing2")],
+        now(),
+    ).unwrap();
+    assert_eq!(removed, 1);
+
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), None);
+    assert_eq!(store.hget(&key, b"f2", now()).unwrap(), Some(Bytes::from("v2")));
+}
+
+#[test]
+fn test_hdel_nonexistent_key() {
+    let store = create_test_store();
+
+    let removed = store.hdel(b"nokey", &[Bytes::from("f1")], now()).unwrap();
+    assert_eq!(removed, 0);
+}
+
+#[test]
+fn test_hdel_removes_empty_hash_key() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[(Bytes::from("f1"), Bytes::from("v1"))],
+        now(),
+    ).unwrap();
+
+    // Delete the only field — key itself should be removed
+    let removed = store.hdel(&key, &[Bytes::from("f1")], now()).unwrap();
+    assert_eq!(removed, 1);
+
+    // Key should no longer exist in the store
+    let shard = &store.shards[store.hash(&key)];
+    assert!(shard.get(key.as_ref()).is_none());
+
+    // hgetall should return empty
+    let pairs = store.hgetall(&key, now()).unwrap();
+    assert!(pairs.is_empty());
+}
+
+#[test]
+fn test_hdel_all_fields_at_once() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[
+            (Bytes::from("f1"), Bytes::from("v1")),
+            (Bytes::from("f2"), Bytes::from("v2")),
+            (Bytes::from("f3"), Bytes::from("v3")),
+        ],
+        now(),
+    ).unwrap();
+
+    let removed = store.hdel(
+        &key,
+        &[Bytes::from("f1"), Bytes::from("f2"), Bytes::from("f3")],
+        now(),
+    ).unwrap();
+    assert_eq!(removed, 3);
+
+    // Key should be auto-removed since hash is empty
+    let shard = &store.shards[store.hash(&key)];
+    assert!(shard.get(key.as_ref()).is_none());
+}
+
+#[test]
+fn test_hdel_wrongtype_error() {
+    let store = create_test_store();
+    let key = Bytes::from("string_key");
+
+    // Set as a string value
+    store.set(key.clone(), Bytes::from("value"), None, now());
+
+    // HDEL on a string key should return WRONGTYPE error
+    let result = store.hdel(&key, &[Bytes::from("f1")], now());
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("WRONGTYPE"));
+}
+
+#[test]
+fn test_hdel_duplicate_fields() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    store.hset(
+        key.clone(),
+        &[(Bytes::from("f1"), Bytes::from("v1"))],
+        now(),
+    ).unwrap();
+
+    // Delete the same field twice in one call — should count only once
+    let removed = store.hdel(
+        &key,
+        &[Bytes::from("f1"), Bytes::from("f1")],
+        now(),
+    ).unwrap();
+    assert_eq!(removed, 1);
+}
+
+#[test]
+fn test_hdel_after_field_update() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    // Set field, then update it
+    store.hset(key.clone(), &[(Bytes::from("f1"), Bytes::from("v1"))], now()).unwrap();
+    store.hset(key.clone(), &[(Bytes::from("f1"), Bytes::from("v2"))], now()).unwrap();
+
+    // Verify the update took effect
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), Some(Bytes::from("v2")));
+
+    // Delete the updated field
+    let removed = store.hdel(&key, &[Bytes::from("f1")], now()).unwrap();
+    assert_eq!(removed, 1);
+
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), None);
+}
+
+#[test]
+fn test_hdel_then_hset_reuses_key() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+
+    // Create hash, delete all fields (key gets removed)
+    store.hset(key.clone(), &[(Bytes::from("f1"), Bytes::from("v1"))], now()).unwrap();
+    store.hdel(&key, &[Bytes::from("f1")], now()).unwrap();
+
+    // Key should be gone
+    assert!(store.hgetall(&key, now()).unwrap().is_empty());
+
+    // Re-create hash at the same key
+    store.hset(key.clone(), &[(Bytes::from("f2"), Bytes::from("v2"))], now()).unwrap();
+
+    assert_eq!(store.hget(&key, b"f2", now()).unwrap(), Some(Bytes::from("v2")));
+    assert_eq!(store.hget(&key, b"f1", now()).unwrap(), None);
+}
+
+#[test]
+fn test_hdel_expired_key_returns_zero() {
+    let store = create_test_store();
+    let key = Bytes::from("myhash");
+    let timestamp = now();
+
+    // Create hash then manually set expiry via shard
+    store.hset(key.clone(), &[(Bytes::from("f1"), Bytes::from("v1"))], timestamp).unwrap();
+
+    let shard = &store.shards[store.hash(&key)];
+    if let Some(mut entry) = shard.get_mut(key.as_ref()) {
+        entry.expiry = Some(timestamp + 1);
+    }
+
+    // At timestamp + 2, the key should be expired
+    let removed = store.hdel(&key, &[Bytes::from("f1")], timestamp + 2).unwrap();
+    assert_eq!(removed, 0);
+
+    // Key should have been cleaned up
+    assert!(shard.get(key.as_ref()).is_none());
+}
+
+#[test]
+fn test_hdel_concurrent_access() {
+    let store = Arc::new(create_test_store());
+    let key = Bytes::from("concurrent_hash");
+
+    // Set up a hash with many fields
+    let fields: Vec<(Bytes, Bytes)> = (0..100)
+        .map(|i| (Bytes::from(format!("field{}", i)), Bytes::from(format!("value{}", i))))
+        .collect();
+    store.hset(key.clone(), &fields, now()).unwrap();
+
+    let mut handles = vec![];
+
+    // Spawn threads to delete different fields concurrently
+    for chunk_start in (0..100).step_by(10) {
+        let store_clone = Arc::clone(&store);
+        let key_clone = key.clone();
+        let handle = thread::spawn(move || {
+            let fields_to_del: Vec<Bytes> = (chunk_start..chunk_start + 10)
+                .map(|i| Bytes::from(format!("field{}", i)))
+                .collect();
+            store_clone.hdel(&key_clone, &fields_to_del, get_timestamp()).unwrap()
+        });
+        handles.push(handle);
+    }
+
+    let total_removed: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(total_removed, 100);
+
+    // Hash should now be empty and key removed
+    let shard = &store.shards[store.hash(&key)];
+    assert!(shard.get(key.as_ref()).is_none());
 }

@@ -219,8 +219,14 @@ impl EvictionPolicy {
 
 // ==================== Storage Entry ====================
 
+#[derive(Clone)]
+pub enum EntryValue {
+    String(Bytes),
+    Hash(Arc<DashMap<Bytes, Bytes>>),
+}
+
 pub struct Entry {
-    pub value: Bytes,
+    pub value: EntryValue,
     pub expiry: Option<u64>,
     pub last_accessed: AtomicU32,
     pub queue_type: AtomicU8,
@@ -279,9 +285,9 @@ impl ShardedStore {
         shard.insert(
             key,
             Entry {
-                value,
+                value: EntryValue::String(value),
                 expiry,
-                last_accessed: AtomicU32::new(0), // Will be set by get_uptime_seconds() in real usage
+                last_accessed: AtomicU32::new(0),
                 queue_type: AtomicU8::new(0),
                 access_count: AtomicU8::new(0),
             },
@@ -292,18 +298,18 @@ impl ShardedStore {
     pub fn get(&self, key: &[u8], now: u64) -> Option<Bytes> {
         let shard = &self.shards[self.hash(key)];
 
-        // Try read-only access first
         if let Some(entry) = shard.get(key) {
             if let Some(expiry) = entry.expiry
                 && now >= expiry
             {
-                // Expired - need to remove
                 drop(entry);
                 shard.remove(key);
                 return None;
             }
 
-            return Some(entry.value.clone());
+            if let EntryValue::String(ref val) = entry.value {
+                return Some(val.clone());
+            }
         }
         None
     }
@@ -368,6 +374,141 @@ impl ShardedStore {
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.clear();
+        }
+    }
+
+    /// Set one or more fields in a hash. Returns the number of new fields added.
+    pub fn hset(&self, key: Bytes, fields: &[(Bytes, Bytes)], now: u64) -> Result<usize, &'static str> {
+        let shard = &self.shards[self.hash(&key)];
+
+        let hash_map = if let Some(entry) = shard.get(&key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                drop(entry);
+                shard.remove(key.as_ref());
+                Arc::new(DashMap::new())
+            } else {
+                match &entry.value {
+                    EntryValue::Hash(h) => {
+                        let new_map = Arc::new(DashMap::new());
+                        for e in h.iter() {
+                            new_map.insert(e.key().clone(), e.value().clone());
+                        }
+                        new_map
+                    }
+                    EntryValue::String(_) => {
+                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                    }
+                }
+            }
+        } else {
+            Arc::new(DashMap::new())
+        };
+
+        let mut new_count = 0;
+        for (field, value) in fields {
+            if hash_map.insert(field.clone(), value.clone()).is_none() {
+                new_count += 1;
+            }
+        }
+
+        shard.insert(key, Entry {
+            value: EntryValue::Hash(hash_map),
+            expiry: None,
+            last_accessed: AtomicU32::new(0),
+            queue_type: AtomicU8::new(0),
+            access_count: AtomicU8::new(0),
+        });
+
+        Ok(new_count)
+    }
+
+    /// Get a field value from a hash.
+    pub fn hget(&self, key: &[u8], field: &[u8], now: u64) -> Result<Option<Bytes>, &'static str> {
+        let shard = &self.shards[self.hash(key)];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                drop(entry);
+                shard.remove(key);
+                return Ok(None);
+            }
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    Ok(hash_map.get(field).map(|v| v.value().clone()))
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all field-value pairs from a hash.
+    pub fn hgetall(&self, key: &[u8], now: u64) -> Result<Vec<Bytes>, &'static str> {
+        let shard = &self.shards[self.hash(key)];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                drop(entry);
+                shard.remove(key);
+                return Ok(Vec::new());
+            }
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    let mut result = Vec::new();
+                    for e in hash_map.iter() {
+                        result.push(e.key().clone());
+                        result.push(e.value().clone());
+                    }
+                    Ok(result)
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Delete one or more fields from a hash. Returns the number of fields removed.
+    /// If the hash becomes empty after deletion, the key itself is removed.
+    pub fn hdel(&self, key: &[u8], fields: &[Bytes], now: u64) -> Result<usize, &'static str> {
+        let shard = &self.shards[self.hash(key)];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                drop(entry);
+                shard.remove(key);
+                return Ok(0);
+            }
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    let mut removed = 0;
+                    for field in fields {
+                        if hash_map.remove(field.as_ref()).is_some() {
+                            removed += 1;
+                        }
+                    }
+
+                    if removed > 0 && hash_map.is_empty() {
+                        drop(entry);
+                        shard.remove(key);
+                    }
+
+                    Ok(removed)
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(0)
         }
     }
 }

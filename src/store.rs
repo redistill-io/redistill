@@ -879,6 +879,64 @@ impl ShardedStore {
             Ok(Vec::new())
         }
     }
+
+    /// Delete one or more fields from a hash. Returns the number of fields removed.
+    /// If the hash becomes empty after deletion, the key itself is removed.
+    pub fn hdel(&self, key: &[u8], fields: &[Bytes], now: u64) -> Result<usize, &'static str> {
+        let key_len = key.len();
+        let shard_idx = self.hash(key);
+        let shard = &self.shards[shard_idx];
+
+        if let Some(entry) = shard.get(key) {
+            if let Some(expiry) = entry.expiry && now >= expiry {
+                // Expired - remove it
+                let key_bytes = Bytes::copy_from_slice(key);
+                let entry_size = calculate_entry_size(key_len, &entry.value);
+                drop(entry);
+
+                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
+                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+                }
+                return Ok(0);
+            }
+
+            match &entry.value {
+                EntryValue::Hash(hash_map) => {
+                    let old_size = calculate_entry_size(key_len, &entry.value);
+
+                    let mut removed = 0;
+                    for field in fields {
+                        if hash_map.remove(field.as_ref()).is_some() {
+                            removed += 1;
+                        }
+                    }
+
+                    if removed > 0 {
+                        if hash_map.is_empty() {
+                            // Hash is now empty - remove the entire key
+                            drop(entry);
+                            if shard.remove(key).is_some() && CONFIG.memory.max_memory > 0 {
+                                MEMORY_USED.fetch_sub(old_size as u64, Ordering::Relaxed);
+                            }
+                        } else if CONFIG.memory.max_memory > 0 {
+                            // Recalculate size after field removal
+                            let new_size = calculate_entry_size(key_len, &entry.value);
+                            if old_size > new_size {
+                                MEMORY_USED.fetch_sub((old_size - new_size) as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    Ok(removed)
+                }
+                EntryValue::String(_) => {
+                    Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                }
+            }
+        } else {
+            Ok(0)
+        }
+    }
 }
 
 // ==================== Helper Functions ====================
