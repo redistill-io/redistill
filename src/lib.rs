@@ -8,9 +8,11 @@ use ahash::AHasher;
 pub use bytes::{Bytes, BytesMut};
 pub use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::hash::Hasher;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -222,7 +224,7 @@ impl EvictionPolicy {
 #[derive(Clone)]
 pub enum EntryValue {
     String(Bytes),
-    Hash(Arc<DashMap<Bytes, Bytes>>),
+    Hash(Arc<RwLock<HashMap<Bytes, Bytes>>>),
 }
 
 pub struct Entry {
@@ -380,44 +382,44 @@ impl ShardedStore {
     /// Set one or more fields in a hash. Returns the number of new fields added.
     pub fn hset(&self, key: Bytes, fields: &[(Bytes, Bytes)], now: u64) -> Result<usize, &'static str> {
         let shard = &self.shards[self.hash(&key)];
-
-        let hash_map = if let Some(entry) = shard.get(&key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
-                drop(entry);
-                shard.remove(key.as_ref());
-                Arc::new(DashMap::new())
-            } else {
-                match &entry.value {
-                    EntryValue::Hash(h) => {
-                        let new_map = Arc::new(DashMap::new());
-                        for e in h.iter() {
-                            new_map.insert(e.key().clone(), e.value().clone());
-                        }
-                        new_map
+        let hash_map = loop {
+            match shard.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(occ) => {
+                    let entry = occ.get();
+                    if let Some(expiry) = entry.expiry && now >= expiry {
+                        occ.remove();
+                        continue;
                     }
-                    EntryValue::String(_) => {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                    match &entry.value {
+                        EntryValue::Hash(h) => break h.clone(),
+                        EntryValue::String(_) => {
+                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                        }
                     }
                 }
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let hash_map = Arc::new(RwLock::new(HashMap::new()));
+                    vac.insert(Entry {
+                        value: EntryValue::Hash(hash_map.clone()),
+                        expiry: None,
+                        last_accessed: AtomicU32::new(0),
+                        queue_type: AtomicU8::new(0),
+                        access_count: AtomicU8::new(0),
+                    });
+                    break hash_map;
+                }
             }
-        } else {
-            Arc::new(DashMap::new())
         };
 
         let mut new_count = 0;
-        for (field, value) in fields {
-            if hash_map.insert(field.clone(), value.clone()).is_none() {
-                new_count += 1;
+        {
+            let mut map_guard = hash_map.write().unwrap();
+            for (field, value) in fields {
+                if map_guard.insert(field.clone(), value.clone()).is_none() {
+                    new_count += 1;
+                }
             }
         }
-
-        shard.insert(key, Entry {
-            value: EntryValue::Hash(hash_map),
-            expiry: None,
-            last_accessed: AtomicU32::new(0),
-            queue_type: AtomicU8::new(0),
-            access_count: AtomicU8::new(0),
-        });
 
         Ok(new_count)
     }
@@ -435,7 +437,8 @@ impl ShardedStore {
 
             match &entry.value {
                 EntryValue::Hash(hash_map) => {
-                    Ok(hash_map.get(field).map(|v| v.value().clone()))
+                    let map_guard = hash_map.read().unwrap();
+                    Ok(map_guard.get(field).cloned())
                 }
                 EntryValue::String(_) => {
                     Err("WRONGTYPE Operation against a key holding the wrong kind of value")
@@ -459,10 +462,11 @@ impl ShardedStore {
 
             match &entry.value {
                 EntryValue::Hash(hash_map) => {
-                    let mut result = Vec::new();
-                    for e in hash_map.iter() {
-                        result.push(e.key().clone());
-                        result.push(e.value().clone());
+                    let map_guard = hash_map.read().unwrap();
+                    let mut result = Vec::with_capacity(map_guard.len() * 2);
+                    for (k, v) in map_guard.iter() {
+                        result.push(k.clone());
+                        result.push(v.clone());
                     }
                     Ok(result)
                 }
@@ -490,13 +494,18 @@ impl ShardedStore {
             match &entry.value {
                 EntryValue::Hash(hash_map) => {
                     let mut removed = 0;
-                    for field in fields {
-                        if hash_map.remove(field.as_ref()).is_some() {
-                            removed += 1;
+                    let is_empty;
+                    {
+                        let mut map_guard = hash_map.write().unwrap();
+                        for field in fields {
+                            if map_guard.remove(field.as_ref()).is_some() {
+                                removed += 1;
+                            }
                         }
+                        is_empty = map_guard.is_empty();
                     }
 
-                    if removed > 0 && hash_map.is_empty() {
+                    if removed > 0 && is_empty {
                         drop(entry);
                         shard.remove(key);
                     }
