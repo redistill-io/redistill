@@ -547,15 +547,18 @@ fn handle_ttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
         Some(entry) => match entry.expiry {
             Some(expiry) => {
                 if now >= expiry {
-                    // Extract info before dropping to avoid race condition
                     let key_bytes = Bytes::copy_from_slice(key);
-                    let key_len = key_bytes.len();
-                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
-                    
-                    // Atomic remove - only one thread can succeed
-                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+
+                    if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                        v.expiry.map_or(false, |exp| now >= exp)
+                    }) {
+                        if CONFIG.memory.max_memory > 0 {
+                            MEMORY_USED.fetch_sub(
+                                store::calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     writer.write_signed_integer(-2);
                 } else {
@@ -581,15 +584,18 @@ fn handle_pttl(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
         Some(entry) => match entry.expiry {
             Some(expiry) => {
                 if now >= expiry {
-                    // Extract info before dropping to avoid race condition
                     let key_bytes = Bytes::copy_from_slice(key);
-                    let key_len = key_bytes.len();
-                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
-                    
-                    // Atomic remove - only one thread can succeed
-                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+
+                    if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                        v.expiry.map_or(false, |exp| now >= exp)
+                    }) {
+                        if CONFIG.memory.max_memory > 0 {
+                            MEMORY_USED.fetch_sub(
+                                store::calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     writer.write_signed_integer(-2);
                 } else {
@@ -637,11 +643,16 @@ fn handle_incr(
                 if now >= expiry {
                     // Expired - remove it, treat as 0, no TTL to preserve
                     let key_bytes = Bytes::copy_from_slice(key);
-                    let key_len = key_bytes.len();
-                    let entry_size = store::calculate_entry_size(key_len, &entry.value);
                     drop(entry);
-                    if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                        MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+                    if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                        v.expiry.map_or(false, |exp| now >= exp)
+                    }) {
+                        if CONFIG.memory.max_memory > 0 {
+                            MEMORY_USED.fetch_sub(
+                                store::calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     (0i64, None, 0)
                 } else {
@@ -914,15 +925,18 @@ fn handle_expire(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrite
         if let Some(expiry) = entry.expiry
             && now >= expiry
         {
-            // Extract info before dropping to avoid race condition
             let key_bytes = Bytes::copy_from_slice(key);
-            let key_len = key_bytes.len();
-            let entry_size = store::calculate_entry_size(key_len, &entry.value);
             drop(entry);
-            
-            // Atomic remove - only one thread can succeed
-            if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+
+            if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                v.expiry.map_or(false, |exp| now >= exp)
+            }) {
+                if CONFIG.memory.max_memory > 0 {
+                    MEMORY_USED.fetch_sub(
+                        store::calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
             }
             writer.write_integer(0);
             return;
@@ -1005,15 +1019,18 @@ fn handle_persist(store: &ShardedStore, command: &[Bytes], writer: &mut RespWrit
     if let Some(mut entry) = shard.get_mut(key.as_ref()) {
         if let Some(expiry) = entry.expiry {
             if now >= expiry {
-                // Extract info before dropping to avoid race condition
                 let key_bytes = Bytes::copy_from_slice(key);
-                let key_len = key_bytes.len();
-                let entry_size = store::calculate_entry_size(key_len, &entry.value);
                 drop(entry);
-                
-                // Atomic remove - only one thread can succeed
-                if shard.remove(key_bytes.as_ref()).is_some() && CONFIG.memory.max_memory > 0 {
-                    MEMORY_USED.fetch_sub(entry_size as u64, Ordering::Relaxed);
+
+                if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                    v.expiry.map_or(false, |exp| now >= exp)
+                }) {
+                    if CONFIG.memory.max_memory > 0 {
+                        MEMORY_USED.fetch_sub(
+                            store::calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
                 writer.write_integer(0);
             } else {

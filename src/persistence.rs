@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::config::CONFIG;
 use crate::store::{Entry, EntryValue, MEMORY_USED, ShardedStore, calculate_entry_size, get_timestamp};
-use std::sync::Arc;
-use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // ==================== Snapshot Constants ====================
 
@@ -96,9 +96,10 @@ pub fn save_snapshot_sync(store: &ShardedStore, path: &str) -> Result<usize, Str
                 let snapshot_value = match &val.value {
                     EntryValue::String(bytes) => SnapshotValue::String(bytes.to_vec()),
                     EntryValue::Hash(hash_map) => {
-                        let mut fields = Vec::new();
-                        for entry in hash_map.iter() {
-                            fields.push((entry.key().to_vec(), entry.value().to_vec()));
+                        let map_guard = hash_map.read().unwrap();
+                        let mut fields = Vec::with_capacity(map_guard.len());
+                        for (k, v) in map_guard.iter() {
+                            fields.push((k.to_vec(), v.to_vec()));
                         }
                         SnapshotValue::Hash(fields)
                     }
@@ -218,11 +219,11 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
                 let value = match snapshot_entry.value {
                     SnapshotValue::String(bytes) => EntryValue::String(Bytes::from(bytes)),
                     SnapshotValue::Hash(fields) => {
-                        let hash_map = Arc::new(DashMap::new());
+                        let mut map = HashMap::new();
                         for (field, val) in fields {
-                            hash_map.insert(Bytes::from(field), Bytes::from(val));
+                            map.insert(Bytes::from(field), Bytes::from(val));
                         }
-                        EntryValue::Hash(hash_map)
+                        EntryValue::Hash(Arc::new(RwLock::new(map)))
                     }
                 };
                 (Bytes::from(snapshot_entry.key), value, expiry)
