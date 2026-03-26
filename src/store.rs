@@ -470,6 +470,40 @@ impl ShardedStore {
         None
     }
 
+    /// Redis `TYPE` reply: `"none"`, `"string"`, or `"hash"`. Lazy-expires like `get` / `TTL`.
+    #[inline(always)]
+    pub fn key_type(&self, key: &[u8], now: u64) -> &'static str {
+        let shard = &self.shards[self.hash(key)];
+
+        let Some(entry) = shard.get(key) else {
+            return "none";
+        };
+
+        if let Some(expiry) = entry.expiry
+            && now >= expiry
+        {
+            let key_bytes = Bytes::copy_from_slice(key);
+            drop(entry);
+
+            if let Some((_, removed)) = shard.remove_if(key_bytes.as_ref(), |_, v| {
+                v.expiry.map_or(false, |exp| now >= exp)
+            }) {
+                if CONFIG.memory.max_memory > 0 {
+                    MEMORY_USED.fetch_sub(
+                        calculate_entry_size(key_bytes.len(), &removed.value) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+            return "none";
+        }
+
+        match &entry.value {
+            EntryValue::String(_) => "string",
+            EntryValue::Hash(_) => "hash",
+        }
+    }
+
     #[inline(always)]
     pub fn delete(&self, keys: &[Bytes], now: u64) -> usize {
         let policy = *EVICTION_POLICY;
