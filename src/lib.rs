@@ -316,6 +316,29 @@ impl ShardedStore {
         None
     }
 
+    /// Redis `TYPE` reply: `"none"`, `"string"`, or `"hash"`. Lazy-expires like `get`.
+    #[inline(always)]
+    pub fn key_type(&self, key: &[u8], now: u64) -> &'static str {
+        let shard = &self.shards[self.hash(key)];
+
+        let Some(entry) = shard.get(key) else {
+            return "none";
+        };
+
+        if let Some(expiry) = entry.expiry
+            && now >= expiry
+        {
+            drop(entry);
+            shard.remove(key);
+            return "none";
+        }
+
+        match &entry.value {
+            EntryValue::String(_) => "string",
+            EntryValue::Hash(_) => "hash",
+        }
+    }
+
     #[inline(always)]
     pub fn delete(&self, keys: &[Bytes]) -> usize {
         // Group by shard for efficiency

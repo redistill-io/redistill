@@ -203,6 +203,15 @@ fn execute_command(
                     handle_hdel(store, command, writer, now);
                     return;
                 }
+                if &lower == b"type" {
+                    if command.len() < 2 {
+                        writer.write_error(b"wrong number of arguments");
+                        return;
+                    }
+                    let t = store.key_type(command[1].as_ref(), now);
+                    writer.write_simple_string(t.as_bytes());
+                    return;
+                }
             }
         }
         6 => {

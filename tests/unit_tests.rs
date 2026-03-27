@@ -1194,6 +1194,44 @@ fn test_hdel_all_fields_at_once() {
 }
 
 #[test]
+fn test_key_type_none() {
+    let store = create_test_store();
+    assert_eq!(store.key_type(b"no_such_key", now()), "none");
+}
+
+#[test]
+fn test_key_type_string() {
+    let store = create_test_store();
+    let key = Bytes::from("type_str");
+    store.set(key.clone(), Bytes::from("v"), None, now());
+    assert_eq!(store.key_type(b"type_str", now()), "string");
+}
+
+#[test]
+fn test_key_type_hash() {
+    let store = create_test_store();
+    let key = Bytes::from("type_hash");
+    store
+        .hset(
+            key.clone(),
+            &[(Bytes::from("f"), Bytes::from("v"))],
+            now(),
+        )
+        .unwrap();
+    assert_eq!(store.key_type(b"type_hash", now()), "hash");
+}
+
+#[test]
+fn test_key_type_expired_removes_and_returns_none() {
+    let store = create_test_store();
+    let key = Bytes::from("type_exp");
+    let t = now();
+    store.set(key.clone(), Bytes::from("v"), Some(1), t);
+    assert_eq!(store.key_type(key.as_ref(), t + 2), "none");
+    assert!(store.get(key.as_ref(), t + 2).is_none());
+}
+
+#[test]
 fn test_hdel_wrongtype_error() {
     let store = create_test_store();
     let key = Bytes::from("string_key");

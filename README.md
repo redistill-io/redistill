@@ -312,6 +312,7 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `GET key` - Retrieve value
 - `DEL key [key ...]` - Delete keys
 - `EXISTS key [key ...]` - Check existence
+- `TYPE key` - Return value type (`string`, `hash`, or `none`)
 - `MSET key value [key value ...]` - Set multiple keys
 - `MGET key [key ...]` - Get multiple keys
 - `HSET key field value [field value ...]` - Set Hash keys
