@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub connection_rate_limit: u64,
     #[serde(default)]
     pub health_check_port: u16,
+    #[serde(default = "default_shutdown_grace_period_secs")]
+    pub shutdown_grace_period_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -119,6 +121,9 @@ fn default_max_connections() -> usize {
 fn default_connection_timeout() -> u64 {
     300
 }
+fn default_shutdown_grace_period_secs() -> u64 {
+    30
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -151,6 +156,7 @@ impl Default for ServerConfig {
             connection_timeout: default_connection_timeout(),
             connection_rate_limit: 0,
             health_check_port: 0,
+            shutdown_grace_period_secs: default_shutdown_grace_period_secs(),
         }
     }
 }
