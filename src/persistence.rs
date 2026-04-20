@@ -280,7 +280,12 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
 
 // ==================== Background Snapshot Task ====================
 
-pub async fn snapshot_task(store: ShardedStore, interval_secs: u64, path: String) {
+pub async fn snapshot_task(
+    store: ShardedStore,
+    interval_secs: u64,
+    path: String,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     if interval_secs == 0 {
         return;
     }
@@ -289,7 +294,11 @@ pub async fn snapshot_task(store: ShardedStore, interval_secs: u64, path: String
     interval.tick().await; // Skip first immediate tick
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => {}
+        }
 
         let store_clone = store.clone();
         let path_clone = path.clone();

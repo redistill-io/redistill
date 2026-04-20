@@ -20,11 +20,15 @@ mod store;
 
 use bytes::Bytes;
 use once_cell::sync::Lazy;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+#[cfg(not(unix))]
 use tokio::signal;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 // Re-export from modules for internal use
@@ -50,13 +54,53 @@ thread_local! {
     static LOCAL_CMD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// ==================== Shutdown Signal ====================
+
+/// Awaits a termination signal. On Unix, resolves on either SIGTERM or SIGINT.
+/// On non-Unix platforms (Windows), resolves on Ctrl-C (SIGTERM does not exist there).
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal as unix_signal};
+    let mut term = match unix_signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to install SIGTERM handler: {}", e);
+            // Fall back to SIGINT only so the server can still be stopped.
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    let mut intr = match unix_signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to install SIGINT handler: {}", e);
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = intr.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(e) = signal::ctrl_c().await {
+        eprintln!("Failed to install ctrl_c handler: {}", e);
+    }
+}
+
 // ==================== Background Tasks ====================
 
-async fn expiration_task(store: ShardedStore) {
+async fn expiration_task(store: ShardedStore, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     loop {
-        interval.tick().await;
-        expire_random_keys(&store, 20);
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => { expire_random_keys(&store, 20); }
+        }
     }
 }
 
@@ -1127,7 +1171,11 @@ fn handle_hdel(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
 
 // ==================== Connection Handling ====================
 
-async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
+async fn handle_connection(
+    mut stream: MaybeStream,
+    store: ShardedStore,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
     let _ = stream.set_nodelay(CONFIG.performance.tcp_nodelay);
 
     TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1144,13 +1192,35 @@ async fn handle_connection(mut stream: MaybeStream, store: ShardedStore) {
         None
     };
 
+    // If shutdown was already signalled when this task got scheduled, exit
+    // before reading. `changed()` below will wait for the next transition,
+    // so check the current value up-front.
+    if *shutdown_rx.borrow() {
+        let _ = writer.flush(&mut stream).await;
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+
     loop {
         let now = get_timestamp();
 
-        let parse_result = if let Some(timeout) = timeout_duration {
-            tokio::time::timeout(timeout, parser.parse_command(&mut stream)).await
-        } else {
-            Ok(parser.parse_command(&mut stream).await)
+        let parse_future = parser.parse_command(&mut stream);
+
+        // `biased` so a pending shutdown is observed before we wait for
+        // another client byte. An in-flight parse finishes, but we won't
+        // start another read after the shutdown is signalled.
+        let parse_result = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+            res = async {
+                if let Some(timeout) = timeout_duration {
+                    tokio::time::timeout(timeout, parse_future).await
+                } else {
+                    Ok(parse_future.await)
+                }
+            } => res,
         };
 
         match parse_result {
@@ -1326,27 +1396,65 @@ async fn main() {
         println!("Authentication disabled");
     }
 
+    // Shutdown channel: level-triggered. `false` = running, `true` = shutting down.
+    let (shutdown_tx, _initial_rx) = watch::channel(false);
+    // Set by the supervisor if a second signal arrives during drain: skip
+    // the grace period and abort in-flight connections immediately.
+    let force_exit = Arc::new(AtomicBool::new(false));
+
+    // Supervisor: first signal begins drain; second signal forces exit.
+    let supervisor = {
+        let shutdown_tx = shutdown_tx.clone();
+        let force_exit = force_exit.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+            // Wait for a possible second signal while the main task drains.
+            shutdown_signal().await;
+            force_exit.store(true, Ordering::SeqCst);
+        })
+    };
+
     // Start health check endpoint if enabled
+    let mut health_task = None;
     if config.server.health_check_port > 0 {
-        tokio::spawn(start_health_check_server(config.server.health_check_port));
+        health_task = Some(tokio::spawn(start_health_check_server(
+            config.server.health_check_port,
+            shutdown_tx.subscribe(),
+        )));
     }
 
     // Start passive key expiration background task
-    tokio::spawn(expiration_task(store.clone()));
+    let expiration_handle = tokio::spawn(expiration_task(store.clone(), shutdown_tx.subscribe()));
 
     // Start periodic snapshot background task if enabled
-    if config.persistence.enabled && config.persistence.snapshot_interval > 0 {
-        tokio::spawn(snapshot_task(
+    let snapshot_handle = if config.persistence.enabled && config.persistence.snapshot_interval > 0
+    {
+        Some(tokio::spawn(snapshot_task(
             store.clone(),
             config.persistence.snapshot_interval,
             config.persistence.snapshot_path.clone(),
-        ));
-    }
+            shutdown_tx.subscribe(),
+        )))
+    } else {
+        None
+    };
 
     println!();
 
+    // Accept loop: one JoinSet tracks all connection tasks so we can drain
+    // them deterministically at shutdown.
+    let mut conn_set: JoinSet<()> = JoinSet::new();
+    let mut accept_shutdown_rx = shutdown_tx.subscribe();
+
     loop {
+        // Opportunistically reap completed handlers to keep the JoinSet bounded
+        // under connection storms.
+        while conn_set.try_join_next().is_some() {}
+
         tokio::select! {
+            biased;
+            _ = accept_shutdown_rx.changed() => break,
             result = listener.accept() => {
                 match result {
                     Ok((tcp_stream, _)) => {
@@ -1363,13 +1471,25 @@ async fn main() {
 
                         let store_clone = store.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
+                        let conn_shutdown_rx = shutdown_tx.subscribe();
 
-                        tokio::spawn(async move {
+                        conn_set.spawn(async move {
                             let stream = if let Some(acceptor) = tls_acceptor_clone {
-                                match acceptor.accept(tcp_stream).await {
-                                    Ok(tls_stream) => MaybeStream::Tls(Box::new(tls_stream)),
-                                    Err(e) => {
+                                // Bound the TLS handshake so a half-open client
+                                // can't keep a slot occupied past the drain window.
+                                match tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    acceptor.accept(tcp_stream),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(tls_stream)) => MaybeStream::Tls(Box::new(tls_stream)),
+                                    Ok(Err(e)) => {
                                         eprintln!("TLS handshake failed: {}", e);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        eprintln!("TLS handshake timed out");
                                         return;
                                     }
                                 }
@@ -1377,31 +1497,110 @@ async fn main() {
                                 MaybeStream::Plain(tcp_stream)
                             };
 
-                            handle_connection(stream, store_clone).await;
+                            handle_connection(stream, store_clone, conn_shutdown_rx).await;
                         });
                     }
                     Err(e) => eprintln!("Accept error: {}", e),
                 }
             }
-            _ = signal::ctrl_c() => {
-                println!("\n\nReceived shutdown signal...");
-
-                if CONFIG.persistence.enabled && CONFIG.persistence.save_on_shutdown {
-                    print!("Saving final snapshot... ");
-                    match save_snapshot_sync(&store, &CONFIG.persistence.snapshot_path) {
-                        Ok(count) => println!("saved {} keys", count),
-                        Err(e) => eprintln!("failed: {}", e),
-                    }
-                }
-
-                println!("Final Stats:");
-                println!("   • Total connections: {}", TOTAL_CONNECTIONS.load(Ordering::Relaxed));
-                println!("   • Total commands: {}", TOTAL_COMMANDS.load(Ordering::Relaxed));
-                println!("   • Active connections: {}", ACTIVE_CONNECTIONS.load(Ordering::Relaxed));
-                println!("   • Keys in database: {}", store.len());
-                println!("\nRedistill shut down gracefully");
-                break;
-            }
         }
     }
+
+    // ==================== Graceful shutdown ====================
+
+    println!("\n\nReceived shutdown signal...");
+    // Drop the listener to immediately stop accepting new connections.
+    drop(listener);
+
+    let grace = Duration::from_secs(CONFIG.server.shutdown_grace_period_secs);
+    println!(
+        "Draining {} in-flight connection(s), grace = {}s",
+        ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
+        grace.as_secs()
+    );
+
+    // Drain connection tasks. A second signal (force_exit) short-circuits.
+    let drain_deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if force_exit.load(Ordering::SeqCst) {
+            println!("Second signal received — aborting in-flight connections");
+            conn_set.abort_all();
+            break;
+        }
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "Drain deadline ({:?}) exceeded with {} task(s) still running — aborting",
+                grace,
+                conn_set.len()
+            );
+            conn_set.abort_all();
+            break;
+        }
+        match tokio::time::timeout(remaining.min(Duration::from_millis(250)), conn_set.join_next())
+            .await
+        {
+            Ok(Some(_)) => {
+                if conn_set.is_empty() {
+                    break;
+                }
+            }
+            Ok(None) => break, // set is empty
+            Err(_) => continue, // polling slice expired, re-check force_exit / deadline
+        }
+    }
+    // Drain any aborted handles so they don't dangle.
+    while conn_set.join_next().await.is_some() {}
+
+    // Stop background tasks. They already received the shutdown signal via
+    // their watch receiver; await them with a short timeout.
+    let bg_timeout = Duration::from_secs(2);
+    let _ = tokio::time::timeout(bg_timeout, expiration_handle).await;
+    if let Some(h) = snapshot_handle {
+        let _ = tokio::time::timeout(bg_timeout, h).await;
+    }
+    if let Some(h) = health_task {
+        let _ = tokio::time::timeout(bg_timeout, h).await;
+    }
+
+    // Final snapshot on shutdown, attempted even on force-exit.
+    if CONFIG.persistence.enabled && CONFIG.persistence.save_on_shutdown {
+        print!("Saving final snapshot... ");
+        let store_for_snapshot = store.clone();
+        let path_for_snapshot = CONFIG.persistence.snapshot_path.clone();
+        // Bound the snapshot so a huge dataset can't hang forever.
+        let snapshot_timeout = grace.max(Duration::from_secs(60));
+        let snapshot = tokio::task::spawn_blocking(move || {
+            save_snapshot_sync(&store_for_snapshot, &path_for_snapshot)
+        });
+        match tokio::time::timeout(snapshot_timeout, snapshot).await {
+            Ok(Ok(Ok(count))) => println!("saved {} keys", count),
+            Ok(Ok(Err(e))) => eprintln!("failed: {}", e),
+            Ok(Err(join_err)) => eprintln!("snapshot task panicked: {}", join_err),
+            Err(_) => eprintln!(
+                "snapshot exceeded {}s bound — possibly partial write",
+                snapshot_timeout.as_secs()
+            ),
+        }
+    }
+
+    // The supervisor may still be waiting for a second signal. Cancel it.
+    supervisor.abort();
+    let _ = supervisor.await;
+
+    println!("Final Stats:");
+    println!(
+        "   • Total connections: {}",
+        TOTAL_CONNECTIONS.load(Ordering::Relaxed)
+    );
+    println!(
+        "   • Total commands: {}",
+        TOTAL_COMMANDS.load(Ordering::Relaxed)
+    );
+    println!(
+        "   • Active connections: {}",
+        ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
+    );
+    println!("   • Keys in database: {}", store.len());
+    println!("\nRedistill shut down gracefully");
 }

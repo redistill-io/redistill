@@ -27,6 +27,7 @@ max_connections = 10000
 connection_timeout = 300
 connection_rate_limit = 0
 health_check_port = 0
+shutdown_grace_period_secs = 30
 
 [security]
 password = ""
@@ -70,6 +71,7 @@ save_on_shutdown = true
 | `connection_timeout` | integer | 300 | Idle connection timeout in seconds (0 = no timeout) |
 | `connection_rate_limit` | integer | 0 | Maximum new connections per second (0 = unlimited) |
 | `health_check_port` | integer | 0 | HTTP health check port (0 = disabled) |
+| `shutdown_grace_period_secs` | integer | 30 | Seconds to drain in-flight connections on SIGTERM/SIGINT before force-exit |
 
 ### Security Configuration
 
@@ -135,6 +137,7 @@ Environment variables override configuration file settings:
 | `REDIS_SNAPSHOT_PATH` | `persistence.snapshot_path` | `REDIS_SNAPSHOT_PATH=/data/redistill.rdb` |
 | `REDIS_SNAPSHOT_INTERVAL` | `persistence.snapshot_interval` | `REDIS_SNAPSHOT_INTERVAL=600` |
 | `REDIS_SAVE_ON_SHUTDOWN` | `persistence.save_on_shutdown` | `REDIS_SAVE_ON_SHUTDOWN=true` |
+| `REDIS_SHUTDOWN_GRACE_SECS` | `server.shutdown_grace_period_secs` | `REDIS_SHUTDOWN_GRACE_SECS=30` |
 
 ## Example Configurations
 

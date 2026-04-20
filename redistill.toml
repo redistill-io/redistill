@@ -17,6 +17,7 @@ max_connections = 10000      # Maximum concurrent connections (0 = unlimited)
 connection_timeout = 300      # Connection timeout in seconds (0 = no timeout)
 connection_rate_limit = 0     # Max new connections per second (0 = unlimited)
 health_check_port = 8080      # HTTP health check port (0 = disabled)
+shutdown_grace_period_secs = 30  # Seconds to drain in-flight connections on SIGTERM/SIGINT before force-exit
 
 [security]
 # Authentication

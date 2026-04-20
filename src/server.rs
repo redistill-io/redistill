@@ -136,7 +136,10 @@ async fn health_handler(
     Ok(response)
 }
 
-pub async fn start_health_check_server(port: u16) {
+pub async fn start_health_check_server(
+    port: u16,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let addr = format!("0.0.0.0:{}", port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -149,9 +152,13 @@ pub async fn start_health_check_server(port: u16) {
     println!("Health check endpoint: http://{}/health", addr);
 
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(_) => continue,
+        let (stream, _) = tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => break,
+            accept = listener.accept() => match accept {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            },
         };
 
         let io = TokioIo::new(stream);
