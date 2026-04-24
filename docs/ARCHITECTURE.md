@@ -13,15 +13,16 @@ This document explains the design decisions, architecture, and trade-offs that m
 
 ## Design Philosophy
 
-Redistill is built on a simple principle: **performance first, optional persistence**. By default, Redistill eliminates persistence overhead to maximize speed, throughput, and low latency. For users who need storage, optional snapshot persistence is available without impacting the hot path.
+Redistill is built on a simple principle: **performance first, opt-in durability**. By default, Redistill eliminates all disk I/O overhead to maximize throughput and minimize latency. When durability is required, both RDB snapshots and AOF (append-only file) are available as independent, opt-in features with configurable fsync policies.
 
 ### Core Principles
 
-1. **Optional Persistence** - Zero disk I/O overhead by default; snapshot support available when needed
+1. **Opt-in durability** - Zero disk I/O on the hot path by default. Users choose RDB, AOF, both, or neither.
 2. **Multi-threaded** - Leverage all CPU cores
 3. **Lock-free Reads** - Concurrent access without blocking
 4. **Zero-copy** - Minimize memory allocations
-5. **Production-ready** - Security, monitoring, and reliability built-in
+5. **Graceful shutdown** - SIGTERM/SIGINT drain in-flight work and flush persistence before exit (Kubernetes-ready)
+6. **Production-ready** - Security, monitoring, and reliability built-in
 
 ## Architecture Overview
 
@@ -29,27 +30,33 @@ Redistill is built on a simple principle: **performance first, optional persiste
 
 ## Performance Optimizations
 
-### 1. Optional Persistence Layer
+### 1. Opt-in Durability Layer (RDB + AOF)
 
 **What Redis Does:**
-- Writes to AOF (Append-Only File) on every write
-- Periodic RDB snapshots
-- fsync() calls for durability
+- AOF (Append-Only File) + RDB snapshots, both typically enabled
+- `fsync()` calls on the hot path (configurable)
 
 **What Redistill Does (Default):**
 - No persistence by default. All data lives in memory only.
-- Zero disk I/O overhead on the hot path
+- Zero disk I/O overhead on the hot path. Hot path checks a single `OnceCell::get()` (a predictable-branch pointer load) to discover that AOF is disabled — no allocation, no lock.
 
-**What Redistill Does (Optional):**
-- Snapshot-based persistence (disabled by default)
-- Background snapshots don't block request handling
-- Streaming serialization
-- Automatic snapshot loading on startup
+**What Redistill Does (Opt-in):**
 
-**Impact:**
-- **Default (disabled)**: Eliminates all disk I/O, no fsync() blocking, simpler code path
-- **Optional (enabled)**: Warm restarts supported, zero impact on GET/SET performance, background saves only
-- Data loss possible between snapshots (by design - not real-time durability)
+| Mode | What it provides | Hot-path cost when enabled |
+|------|------------------|----------------------------|
+| `persistence.enabled = true` (RDB) | Periodic snapshots via `BGSAVE`, snapshot-on-shutdown | Zero — background task only |
+| `persistence.aof_enabled = true` + `aof_fsync = "no"` | Crash-survivable log, OS-flushed (~30s loss) | Negligible (~0% at P=1, ~20% at P=16+ from the append mutex) |
+| `aof_fsync = "everysec"` (default when AOF on) | ≤1s loss, background fsync | Same as `no` |
+| `aof_fsync = "always"` | Zero loss | ~550× slower — only for financial-grade needs |
+
+**Both RDB and AOF can be enabled simultaneously.** On startup RDB is loaded first, then the AOF tail is replayed on top — matching Redis semantics.
+
+**AOF rewrite (compaction):** The log is replaced periodically with a minimal `SET`/`HSET`-per-live-key serialization so it doesn't grow unboundedly. Triggered manually via `BGREWRITEAOF` or automatically when size crosses `aof_rewrite_percentage` × `last_rewrite_size`. Currently stop-the-world for the duration of the snapshot walk; concurrent rewrite is a future optimization.
+
+**Implementation details:**
+- RDB: bincode + atomic rename. See `src/persistence.rs`.
+- AOF: `Mutex<BufWriter<File>>` + append-then-(maybe-fsync). RESP format. Replay dispatches through the same `execute_command` path as live traffic — one code path, one source of truth. See `src/aof.rs`.
+- Both: background tasks (periodic snapshot, everysec fsync, rewrite supervisor) each take a `watch::Receiver<bool>` shutdown signal and exit cleanly on SIGTERM.
 
 ### 2. Multi-threaded Architecture
 

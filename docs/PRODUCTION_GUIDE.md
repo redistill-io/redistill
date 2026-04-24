@@ -124,27 +124,45 @@ Use production certificates:
 
 ### 6. Persistence Configuration (Optional)
 
-**Requirement**: Optional - Enable for warm restarts
+Redistill offers two independent persistence mechanisms. Pick the combination that matches your durability SLA.
+
+**Decision matrix:**
+
+| Workload | Recommended config | Loss window on crash |
+|----------|-------------------|----------------------|
+| Pure cache (data regeneratable) | Both disabled (default) | Everything in memory |
+| Cache with warm restart | `enabled = true` (RDB only) | Up to `snapshot_interval` (default 5 min) |
+| Session store / rate limiter / queue | `aof_enabled = true`, `aof_fsync = "everysec"` | ≤ 1 second |
+| Financial / compliance | `aof_enabled = true`, `aof_fsync = "always"` | Zero — expect ~550× write slowdown |
+
+**Full example — recommended for durability-sensitive production:**
 
 ```toml
 [persistence]
-enabled = true                    # Enable snapshot persistence
-snapshot_path = "/data/redistill.rdb"  # Snapshot file path
-snapshot_interval = 300           # Auto-save every 5 minutes (0 = disabled)
-save_on_shutdown = true          # Save snapshot on graceful shutdown
+# RDB — a stable snapshot acts as the compaction base for AOF and speeds up
+# cold starts on very large datasets.
+enabled = true
+snapshot_path = "/data/redistill.rdb"
+snapshot_interval = 300
+save_on_shutdown = true
+
+# AOF — the real durability mechanism. Replayed on startup after the RDB.
+aof_enabled = true
+aof_path = "/data/redistill.aof"
+aof_fsync = "everysec"
+aof_rewrite_min_size = 67108864   # 64 MiB
+aof_rewrite_percentage = 100      # Auto-rewrite when log doubles past last rewrite
+
+[server]
+shutdown_grace_period_secs = 30   # Kubernetes terminationGracePeriodSeconds should be >= this
 ```
 
-**When to Enable:**
-- Need warm restarts after deployments
-- Can tolerate slight performance overhead
-- Want to preserve data across restarts
+**Operational notes:**
 
-**When to Keep Disabled:**
-- Maximum performance is critical
-- Data can be regenerated
-- Using external persistence layer
-
-**Note:** Persistence is disabled by default for maximum performance. When enabled, snapshots are saved in the background and don't block request handling.
+- **`aof_fsync = "always"` costs ~550× on write-heavy workloads on typical SSDs.** Don't reach for it unless each individual write must survive a power loss. `everysec` is the sweet spot and matches Redis's default.
+- **AOF rewrite is stop-the-world** for the duration of the live-store walk (O(live keys), typically tens of ms at the 64 MiB default trigger). Trigger it manually with `BGREWRITEAOF` during low-traffic windows if the automatic trigger is unacceptable; set `aof_rewrite_percentage = 0` to disable automatic rewrite entirely.
+- **Graceful shutdown** (SIGTERM) flushes AOF + runs a final snapshot before exit, bounded by `shutdown_grace_period_secs`. Set your orchestrator's `terminationGracePeriodSeconds` / `TimeoutStopSec` to at least that value.
+- **Startup order:** RDB loads first, then AOF replays on top. A malformed AOF aborts startup rather than silently losing data — `redis-check-aof`-style repair is a future feature; for now, restore from backup or truncate manually if required.
 
 ## Deployment Methods
 

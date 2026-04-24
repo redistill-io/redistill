@@ -120,9 +120,13 @@
 ### Reliability Features
 
 **Graceful Shutdown**:
-- Signal handling (SIGTERM, SIGINT)
-- Connection cleanup
-- Final statistics reporting
+- Signal handling for both **SIGTERM** (Kubernetes/systemd) and **SIGINT** (Ctrl-C) on Unix; Ctrl-C on Windows
+- Listener is dropped immediately → no new connections accepted
+- In-flight connections are drained within `shutdown_grace_period_secs` (default 30s); handlers finish their current command and exit on the next read
+- Background tasks (expiration, periodic snapshot, AOF everysec, AOF rewrite supervisor, health check) stop cleanly on a shared shutdown watch channel
+- A **second** SIGTERM/SIGINT forces immediate abort of in-flight connections for fast pod rotation
+- Final AOF fsync + final RDB snapshot (when enabled) run before exit, each with its own timeout bound so a huge dataset can't hang the process
+- Final statistics printed to stdout
 
 **Health Monitoring**:
 - HTTP health check endpoint
@@ -169,41 +173,84 @@
 
 ### Persistence (Optional)
 
-Redistill supports **optional snapshot persistence** for warm restarts. Disabled by default for maximum performance.
+Redistill supports **two independent persistence mechanisms**: RDB snapshots and AOF. Both are disabled by default for maximum performance. You can enable either, both, or neither.
+
+**On startup** (matches Redis semantics):
+1. If `persistence.enabled`, load the RDB snapshot.
+2. If `persistence.aof_enabled`, replay the AOF on top. The AOF is fed through the same command dispatch code path as live traffic, so replay semantics can never diverge from live semantics.
+3. A malformed AOF aborts startup rather than silently losing data.
+
+#### RDB (point-in-time snapshots)
 
 **Commands:**
 - `SAVE` - Synchronous snapshot (blocks until complete)
 - `BGSAVE` - Background snapshot (returns immediately)
 - `LASTSAVE` - Unix timestamp of last successful save
-- `FLUSHALL` - Clear all keys
 
 **Configuration:**
 ```toml
 [persistence]
-enabled = false                   # Enable persistence (default: false)
+enabled = false                   # Enable RDB
 snapshot_path = "redistill.rdb"   # Snapshot file path
 snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled)
 save_on_shutdown = true           # Save on graceful shutdown
 ```
 
 **Features:**
-- Streaming serialization
-- Atomic file writes
+- Streaming bincode serialization
+- Atomic file writes via rename
 - Automatic snapshot loading on startup
 - Background saves don't block request handling
 - Skips expired keys during save/load
 
-**Note:** This is snapshot-only persistence (RDB-like). No AOF/write-ahead logging. Data loss possible between snapshots.
+**Loss window:** up to one `snapshot_interval` (default 5 min) on hard crash. Acceptable for cache workloads; pair with AOF if unacceptable.
+
+#### AOF (append-only file)
+
+Every successful write command (SET, DEL, INCR/DECR/INCRBY/DECRBY, MSET, EXPIRE, PERSIST, HSET, HDEL) is appended to a log file in RESP format. On startup the log is replayed to reconstruct live state.
+
+**Configuration:**
+```toml
+[persistence]
+aof_enabled = false               # Enable AOF
+aof_path = "redistill.aof"        # AOF file path
+aof_fsync = "everysec"            # Durability policy (see below)
+aof_rewrite_min_size = 67108864   # Min bytes before auto-rewrite is considered (64 MiB)
+aof_rewrite_percentage = 100      # Auto-rewrite when log has grown this % past the last-rewrite size (0 = manual only)
+```
+
+**Fsync policies:**
+
+| Policy | Loss window on crash | Write-path cost | When to use |
+|---|---|---|---|
+| `always` | Zero | ~550× slower (per-write fsync) | Financial-grade durability |
+| `everysec` (default) | ≤1 second | ~0% at P=1, ~20% at P=16+ | **The sweet spot** — matches Redis default |
+| `no` | Kernel dependent (~30s on Linux) | Negligible | Maximum speed with best-effort durability |
+
+**Commands:**
+- `BGREWRITEAOF` - Trigger asynchronous log compaction. Errors with `-AOF is disabled` or `-…already in progress` as appropriate. Replies `+Background append only file rewriting started` immediately; the rewrite runs on a blocking task.
+
+**AOF rewrite (compaction):**
+
+Without compaction, the AOF grows unboundedly: 10M `INCR foo` commands = 10M log entries for 8 bytes of state. Rewrite walks the live store and emits a single `SET`/`HSET` per key (plus `EXPIRE` for keys with TTL), atomically replacing the file.
+
+- **Manual trigger:** `BGREWRITEAOF` command.
+- **Automatic trigger:** background supervisor polls every 10s; rewrites when `size ≥ last_rewrite_size × (1 + pct/100)` AND `size ≥ aof_rewrite_min_size`. Set `aof_rewrite_percentage = 0` to disable auto-rewrite.
+- **Current implementation is stop-the-world:** writes block for the duration of the snapshot walk (O(live keys)). Acceptable at the default 64 MiB trigger. Concurrent rewrite (diff-during-snapshot) is a future optimization.
+
+**Known performance characteristics** (measured, MacBook-class SSD, `-n 500000 -c 50 -d 64`):
+
+| Mode | SET P=1 | SET P=16 | SET P=128 | GET (any P) |
+|------|--------:|---------:|----------:|-------------|
+| RDB only / none | 150–170k rps | 1.9M | 3.1M | unchanged |
+| `aof-no` / `aof-everysec` | 170k (≈none) | ~1.5M (−20%) | ~1.7M (−45%) | unchanged |
+| `aof-always` | ~270 rps | unusable | unusable | unchanged |
+
+Write-path overhead at P=16+ comes from the single `Mutex<BufWriter<File>>` serializing appends. At interactive pipeline depths (P=1–8) the mutex is effectively uncontended. The matrix is reproducible via `tests/benchmarks/persistence_bench.sh`.
 
 ## Not Implemented
 
 The following Redis features are intentionally not implemented:
-
-### Write-Ahead Logging (AOF)
-
-**Excluded**: AOF append-only file, fsync modes
-
-**Rationale**: AOF adds write latency. Snapshot persistence is sufficient for warm restarts.
 
 ### Replication
 
@@ -291,8 +338,6 @@ Potential additions based on user feedback:
 
 ### Poor Fit
 
-**Persistent Storage**: No disk persistence
-
 **Complex Queries**: Only key-based lookup
 
 **Large Datasets**: In-memory only
@@ -312,7 +357,7 @@ Potential additions based on user feedback:
 | Bulk operations | MGET, MSET | Full set |
 | Key scanning | SCAN (non-blocking), KEYS (blocking) | Full set |
 | Conditional SET | NX, XX, GET options | Full set |
-| Persistence | None | AOF, RDB |
+| Persistence | RDB + AOF (both optional, independent) | AOF, RDB |
 | Replication | None | Master-replica |
 | Clustering | None | Redis Cluster |
 | Memory management | LRU, Random, S3-FIFO eviction | Multiple policies |

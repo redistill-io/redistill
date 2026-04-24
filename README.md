@@ -26,7 +26,8 @@ Redistill is:
 - **9.07M operations/second** - 4.5x faster than Redis, 1.7x faster than Dragonfly
 - **5x lower latency** (p50: 0.48ms vs Redis 2.38ms)
 - Multi-threaded architecture with lock-free reads
-- **Optional persistence** - Snapshot support for warm restarts (disabled by default for max performance)
+- **Optional persistence** - RDB snapshots and/or AOF (append-only file) with configurable fsync; both disabled by default for max performance
+- **Graceful shutdown** - honours SIGTERM/SIGINT with configurable drain window (Kubernetes-ready)
 - Production-ready security and monitoring features
 
 ## Why Redistill?
@@ -38,7 +39,7 @@ Redistill is:
 - **Drop-in Compatible** - Works with existing Redis clients  
 - **Production Ready** - TLS, authentication, monitoring, health checks  
 - **Multi-threaded** - Utilizes all CPU cores efficiently
-- **Optional Persistence** - Snapshot support for warm restarts when needed (disabled by default)  
+- **Optional Persistence** - Independent RDB + AOF; pick none, either, or both. AOF supports `always` / `everysec` / `no` fsync
 
 ## Setting performance standard
 
@@ -166,9 +167,10 @@ Redistill is a high-performance key-value database perfect for applications requ
 
 ### Not Recommended For
 
-- **Critical persistent data** (optional snapshots available, but not real-time durability)
-- **Financial or transactional data** (use ACID-compliant database)
-- **Data that cannot be regenerated** (use a database)
+- **Financial or transactional data** (use ACID-compliant database — Redistill has no multi-key transactions)
+- **Workloads requiring replication/HA today** (replication is on the roadmap, not shipped)
+
+With `aof_enabled = true` and `aof_fsync = "always"`, Redistill provides per-write fsync durability — similar guarantees to Redis AOF. `everysec` (default when AOF is enabled) bounds loss to ~1 second.
 
 > For code examples and patterns, see [Practical Examples](docs/EXAMPLES.md).
 
@@ -292,10 +294,22 @@ batch_size = 256
 buffer_pool_size = 2048
 
 [persistence]
-enabled = false                   # Enable for warm restarts (disabled by default for max speed)
+# --- RDB (point-in-time snapshots) ---
+enabled = false                   # Enable RDB snapshots (disabled by default for max speed)
 snapshot_path = "redistill.rdb"   # Snapshot file path
 snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled)
 save_on_shutdown = true           # Save snapshot on graceful shutdown
+
+# --- AOF (append-only file, independent of RDB) ---
+aof_enabled = false               # Log every write command to a file
+aof_path = "redistill.aof"        # AOF file path
+aof_fsync = "everysec"            # "always" | "everysec" (default) | "no"
+aof_rewrite_min_size = 67108864   # Min log size (bytes) before auto-rewrite (64 MiB)
+aof_rewrite_percentage = 100      # Rewrite when log has doubled since last rewrite (0 = manual only)
+
+[server]
+# ... plus a shutdown knob that governs SIGTERM drain:
+shutdown_grace_period_secs = 30   # Max seconds to drain in-flight connections
 ```
 
 **Quick Tips:**
@@ -333,9 +347,10 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - `PERSIST key` - Remove TTL from key
 
 **Persistence Commands:** (when enabled)
-- `SAVE` - Synchronous snapshot
-- `BGSAVE` - Background snapshot
-- `LASTSAVE` - Last save timestamp
+- `SAVE` - Synchronous RDB snapshot
+- `BGSAVE` - Background RDB snapshot
+- `LASTSAVE` - Last RDB save timestamp
+- `BGREWRITEAOF` - Compact the AOF asynchronously (errors if AOF disabled or rewrite already in progress)
 
 **Server Commands:**
 - `PING` - Health check
@@ -355,18 +370,22 @@ save_on_shutdown = true           # Save snapshot on graceful shutdown
 - Connection limits and rate limiting
 
 **Reliability:**
-- Memory limits with automatic eviction (LRU, Random, No-eviction)
-- Graceful shutdown with connection draining
+- Memory limits with automatic eviction (LRU, Random, S3-FIFO, No-eviction)
+- **Graceful shutdown** — SIGTERM/SIGINT drain in-flight connections within `shutdown_grace_period_secs` (default 30s); second signal forces abort; background tasks stop cleanly; final RDB/AOF fsync before exit
 - Health check HTTP endpoint
-- **Optional persistence** - Snapshot support for warm restarts (disabled by default)
+- **Optional persistence** — RDB snapshots and/or AOF (disabled by default)
 
-**Persistence (Optional):**
-- Snapshot-based persistence for warm restarts
-- Background snapshots (non-blocking)
-- Automatic snapshot loading on startup
-- Configurable snapshot interval (default: 5 minutes)
-- Save on graceful shutdown
-- Zero performance impact when disabled (default)
+**Persistence (Optional, independent):**
+- **RDB snapshots** — periodic point-in-time saves (bincode format, atomic write), background or synchronous (`BGSAVE`/`SAVE`)
+- **AOF (append-only file)** — every write logged in RESP format
+  - `aof_fsync = "always"` — per-write fsync (zero loss, ~550× slower on write-heavy workloads)
+  - `aof_fsync = "everysec"` — background fsync every second (default when enabled, ≤1s loss)
+  - `aof_fsync = "no"` — rely on OS page-cache flush (fastest, ~30s loss on Linux)
+  - Startup replays AOF through the live dispatch path — single source of truth for command semantics
+  - Refuses to start on a corrupt AOF rather than silently lose data
+- **AOF rewrite (compaction)** — `BGREWRITEAOF` or auto-trigger when log grows past `aof_rewrite_percentage` of the last-rewrite size (default 100%, floor 64 MiB); emits one `SET`/`HSET`/`EXPIRE` per live key; atomic swap
+- **Both modes combined** — Redis-style: RDB loads first at boot, then AOF tail is replayed on top
+- Zero performance impact when both disabled (default)
 
 **Monitoring:**
 - INFO command with server statistics
@@ -440,7 +459,7 @@ A: Use client-side sharding or a proxy like Twemproxy. Clustering support is on 
 A: Configure `max_memory` and `eviction_policy` in the configuration. Redistill automatically evicts keys when the limit is reached.
 
 **Q: When should I use Redis instead?**  
-A: Use Redis if you need real-time durability (AOF), replication, clustering, or complex data types (lists, sets, hashes). Use Redistill for maximum cache performance with optional snapshot persistence for warm restarts.
+A: Use Redis if you need replication, clustering, or the full Redis data-type surface (lists, sets, sorted sets, streams, pub/sub). Redistill now supports both RDB snapshots and AOF (append-only file) with configurable fsync, so real-time durability is no longer a Redis-only feature.
 
 **Q: Is it stable?**  
 A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and production workloads. All core functionality is stable.
@@ -454,7 +473,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | Throughput (clustered) | Manual sharding | Scales horizontally | Redis Cluster scales horizontally |
 | Latency (p50) | **0.48ms** | 0.81ms | 2.38ms |
 | Concurrency model | Multi-threaded | Multi-threaded | Single-threaded |
-| Persistence | Optional (snapshots) | Yes (AOF/RDB) | Yes (AOF/RDB) |
+| Persistence | Yes (RDB + AOF, both optional) | Yes (AOF/RDB) | Yes (AOF/RDB) |
 | Replication | No | Yes | Yes |
 | Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
 | Data types | String (KV) + Hash | Full Redis | Full Redis |
@@ -471,9 +490,9 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 - Maximum throughput and minimum latency
 
 **When to Use Redis/Dragonfly:**
-- Need real-time durability (AOF) or replication
+- Need replication / HA (on Redistill's roadmap, not yet shipped)
 - Need clustering
-- Complex data structures required
+- Complex data structures required (lists, sets, sorted sets, streams, pub/sub)
 - Established ecosystem and tooling critical
 
 ## Contributing
