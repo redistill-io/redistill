@@ -409,20 +409,29 @@ impl ShardedStore {
     }
 
     /// Set one or more fields in a hash. Returns the number of new fields added.
-    pub fn hset(&self, key: Bytes, fields: &[(Bytes, Bytes)], now: u64) -> Result<usize, &'static str> {
+    pub fn hset(
+        &self,
+        key: Bytes,
+        fields: &[(Bytes, Bytes)],
+        now: u64,
+    ) -> Result<usize, &'static str> {
         let shard = &self.shards[self.hash(&key)];
         let hash_map = loop {
             match shard.entry(key.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(occ) => {
                     let entry = occ.get();
-                    if let Some(expiry) = entry.expiry && now >= expiry {
+                    if let Some(expiry) = entry.expiry
+                        && now >= expiry
+                    {
                         occ.remove();
                         continue;
                     }
                     match &entry.value {
                         EntryValue::Hash(h) => break h.clone(),
                         EntryValue::String(_) => {
-                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
                         }
                     }
                 }
@@ -458,7 +467,9 @@ impl ShardedStore {
         let shard = &self.shards[self.hash(key)];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 drop(entry);
                 shard.remove(key);
                 return Ok(None);
@@ -483,7 +494,9 @@ impl ShardedStore {
         let shard = &self.shards[self.hash(key)];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 drop(entry);
                 shard.remove(key);
                 return Ok(Vec::new());
@@ -514,7 +527,9 @@ impl ShardedStore {
         let shard = &self.shards[self.hash(key)];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 drop(entry);
                 shard.remove(key);
                 return Ok(0);

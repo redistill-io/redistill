@@ -34,26 +34,26 @@ async fn wait_for_server(port: u16, max_attempts: u32) -> bool {
 async fn test_ttl_concurrent_operations() {
     // This test should be run with a server already started
     // cargo test --test concurrency_tests test_ttl_concurrent_operations -- --ignored --nocapture
-    
+
     const PORT: u16 = 6379;
     const NUM_THREADS: usize = 50;
     const OPERATIONS_PER_THREAD: usize = 1000;
-    
+
     // Wait for server
     if !wait_for_server(PORT, 50).await {
         eprintln!("Server not available on port {}. Start server first.", PORT);
         return;
     }
-    
+
     let success_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    
+
     // Spawn threads that perform TTL operations concurrently
     for thread_id in 0..NUM_THREADS {
         let success = success_count.clone();
         let errors = error_count.clone();
-        
+
         let handle = thread::spawn(move || {
             let mut conn = match create_connection(PORT) {
                 Ok(c) => c,
@@ -63,10 +63,10 @@ async fn test_ttl_concurrent_operations() {
                     return;
                 }
             };
-            
+
             for i in 0..OPERATIONS_PER_THREAD {
                 let key = format!("ttl_test:{}:{}", thread_id, i);
-                
+
                 // Set key with TTL using SET key value EX seconds (Redistill doesn't support SETEX)
                 let _: Result<(), _> = redis::cmd("SET")
                     .arg(&key)
@@ -74,7 +74,7 @@ async fn test_ttl_concurrent_operations() {
                     .arg("EX")
                     .arg(60u64)
                     .query(&mut conn);
-                
+
                 // Immediately check TTL (race condition test)
                 match conn.ttl::<_, i64>(&key) {
                     Ok(ttl) => {
@@ -89,7 +89,7 @@ async fn test_ttl_concurrent_operations() {
                         errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                
+
                 // Check PTTL
                 match conn.pttl::<_, i64>(&key) {
                     Ok(pttl) => {
@@ -106,25 +106,28 @@ async fn test_ttl_concurrent_operations() {
                 }
             }
         });
-        
+
         handles.push(handle);
     }
-    
+
     // Wait for all threads
     for handle in handles {
         handle.join().unwrap();
     }
-    
+
     let total_ops = NUM_THREADS * OPERATIONS_PER_THREAD * 2; // TTL + PTTL
     let successes = success_count.load(Ordering::Relaxed);
     let errors = error_count.load(Ordering::Relaxed);
-    
+
     println!("\n=== TTL Concurrency Test Results ===");
     println!("Total operations: {}", total_ops);
     println!("Successful: {}", successes);
     println!("Errors: {}", errors);
-    println!("Success rate: {:.2}%", (successes as f64 / total_ops as f64) * 100.0);
-    
+    println!(
+        "Success rate: {:.2}%",
+        (successes as f64 / total_ops as f64) * 100.0
+    );
+
     // Should have at least 95% success rate
     assert!(
         successes as f64 / total_ops as f64 > 0.95,
@@ -140,14 +143,14 @@ async fn test_expired_key_removal_race() {
     // Test race condition when multiple threads access expired keys
     const PORT: u16 = 6379;
     const NUM_THREADS: usize = 100;
-    
+
     if !wait_for_server(PORT, 50).await {
         eprintln!("Server not available. Start server first.");
         return;
     }
-    
+
     let mut conn = create_connection(PORT).unwrap();
-    
+
     // Set a key that expires in 1 second using SET key value EX seconds
     let _: () = redis::cmd("SET")
         .arg("expire_race:key")
@@ -156,20 +159,20 @@ async fn test_expired_key_removal_race() {
         .arg(1u64)
         .query(&mut conn)
         .unwrap();
-    
+
     // Wait for it to expire
     thread::sleep(Duration::from_secs(2));
-    
+
     let success_count = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    
+
     // Multiple threads try to access expired key simultaneously
     for _ in 0..NUM_THREADS {
         let success = success_count.clone();
-        
+
         let handle = thread::spawn(move || {
             let mut conn = create_connection(PORT).unwrap();
-            
+
             // All should get -2 (key doesn't exist)
             match conn.ttl::<_, i64>("expire_race:key") {
                 Ok(ttl) if ttl == -2 => {
@@ -183,18 +186,21 @@ async fn test_expired_key_removal_race() {
                 }
             }
         });
-        
+
         handles.push(handle);
     }
-    
+
     for handle in handles {
         handle.join().unwrap();
     }
-    
+
     let successes = success_count.load(Ordering::Relaxed);
     println!("\n=== Expired Key Race Test ===");
-    println!("All threads got correct result (-2): {}/{}", successes, NUM_THREADS);
-    
+    println!(
+        "All threads got correct result (-2): {}/{}",
+        successes, NUM_THREADS
+    );
+
     assert_eq!(successes, NUM_THREADS, "Not all threads got correct result");
 }
 
@@ -204,15 +210,15 @@ async fn test_ttl_pttl_consistency() {
     // Test that TTL and PTTL are consistent
     const PORT: u16 = 6379;
     const TEST_DURATION_SECS: u64 = 30;
-    
+
     if !wait_for_server(PORT, 50).await {
         eprintln!("Server not available. Start server first.");
         return;
     }
-    
+
     let mut conn = create_connection(PORT).unwrap();
     let key = "consistency_test:key";
-    
+
     // Set with 60 second TTL using SET key value EX seconds
     let _: () = redis::cmd("SET")
         .arg(key)
@@ -221,41 +227,44 @@ async fn test_ttl_pttl_consistency() {
         .arg(60u64)
         .query(&mut conn)
         .unwrap();
-    
+
     let start = std::time::Instant::now();
     let inconsistencies = Arc::new(AtomicUsize::new(0));
     let checks = Arc::new(AtomicUsize::new(0));
-    
+
     while start.elapsed().as_secs() < TEST_DURATION_SECS {
         let inc = inconsistencies.clone();
         let chk = checks.clone();
-        
+
         thread::spawn(move || {
             let mut conn = create_connection(PORT).unwrap();
-            
+
             let ttl: i64 = conn.ttl(key).unwrap_or(-1);
             let pttl: i64 = conn.pttl(key).unwrap_or(-1);
-            
+
             chk.fetch_add(1, Ordering::Relaxed);
-            
+
             // Convert PTTL to seconds and compare
             if ttl == -1 && pttl == -1 {
                 // Both should indicate no expiry
                 return;
             }
-            
+
             if ttl == -2 && pttl == -2 {
                 // Both should indicate key doesn't exist
                 return;
             }
-            
+
             if ttl >= 0 && pttl >= 0 {
                 // PTTL should be approximately TTL * 1000 (within 1 second tolerance)
                 let ttl_ms = (ttl as i64) * 1000;
                 let diff = (pttl - ttl_ms).abs();
                 if diff > 1000 {
                     inc.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("Inconsistency: TTL={}s, PTTL={}ms (diff={}ms)", ttl, pttl, diff);
+                    eprintln!(
+                        "Inconsistency: TTL={}s, PTTL={}ms (diff={}ms)",
+                        ttl, pttl, diff
+                    );
                 }
             } else {
                 inc.fetch_add(1, Ordering::Relaxed);
@@ -264,17 +273,17 @@ async fn test_ttl_pttl_consistency() {
         })
         .join()
         .unwrap();
-        
+
         thread::sleep(Duration::from_millis(100));
     }
-    
+
     let inc_count = inconsistencies.load(Ordering::Relaxed);
     let check_count = checks.load(Ordering::Relaxed);
-    
+
     println!("\n=== TTL/PTTL Consistency Test ===");
     println!("Checks performed: {}", check_count);
     println!("Inconsistencies: {}", inc_count);
-    
+
     // Should have very few or no inconsistencies
     assert!(
         inc_count < check_count / 100,

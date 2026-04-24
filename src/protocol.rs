@@ -156,6 +156,13 @@ impl RespWriter {
         }
     }
 
+    /// Drop accumulated bytes. Used by the AOF replay path to reuse a single
+    /// scratch writer across many dispatches without growing the buffer.
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
     #[inline(always)]
     pub fn write_u64(&mut self, mut n: u64) {
         if n == 0 {

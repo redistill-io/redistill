@@ -12,6 +12,7 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+mod aof;
 mod config;
 mod persistence;
 mod protocol;
@@ -41,13 +42,32 @@ use server::{
     ConnectionState, MaybeStream, check_rate_limit, load_tls_config, start_health_check_server,
 };
 use store::{
-    ACTIVE_CONNECTIONS, EVICTED_KEYS, MEMORY_USED, REJECTED_CONNECTIONS, ShardedStore,
-    TOTAL_COMMANDS, TOTAL_CONNECTIONS, EntryValue, entry_size, evict_if_needed, expire_random_keys,
+    ACTIVE_CONNECTIONS, EVICTED_KEYS, EntryValue, MEMORY_USED, REJECTED_CONNECTIONS, ShardedStore,
+    TOTAL_COMMANDS, TOTAL_CONNECTIONS, entry_size, evict_if_needed, expire_random_keys,
     get_timestamp,
 };
 
 // Server start time for uptime tracking
 static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+
+// Global AOF handle. Set at startup iff persistence.aof_enabled. When unset
+// (the default), the hot-path branches below are a single predictable
+// `OnceCell::get()` returning None — no allocation, no lock.
+static AOF: once_cell::sync::OnceCell<Arc<aof::Aof>> = once_cell::sync::OnceCell::new();
+
+/// Append a write command to the AOF if enabled. Designed to be inlined into
+/// the dispatch in `execute_command`.
+#[inline]
+fn aof_log(command: &[Bytes]) {
+    if let Some(aof) = AOF.get()
+        && let Err(e) = aof.append(command)
+    {
+        // AOF write errors are a durability incident but not fatal — a running
+        // cache is better than a dead one. Surface loudly; future work: track
+        // a counter and expose via INFO.
+        eprintln!("AOF append failed: {}", e);
+    }
+}
 
 // Thread-local command counter for batching updates
 thread_local! {
@@ -145,6 +165,7 @@ fn execute_command(
         3 => {
             if eq_ignore_case_3(cmd, b"set") {
                 handle_set(store, command, writer, now);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_3(cmd, b"ttl") {
@@ -166,6 +187,9 @@ fn execute_command(
                 if command.len() >= 2 {
                     let count = store.delete(&command[1..], now);
                     writer.write_integer(count);
+                    // Only log on deletes that passed arg validation; an empty
+                    // DEL is a no-op we don't need to replay.
+                    aof_log(command);
                 } else {
                     writer.write_error(b"wrong number of arguments");
                 }
@@ -198,10 +222,12 @@ fn execute_command(
             }
             if eq_ignore_case_3(&cmd[..3], b"inc") && (cmd[3] | 0x20) == b'r' {
                 handle_incr(store, command, writer, now, 1);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"dec") && (cmd[3] | 0x20) == b'r' {
                 handle_incr(store, command, writer, now, -1);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"ptt") && (cmd[3] | 0x20) == b'l' {
@@ -214,6 +240,7 @@ fn execute_command(
             }
             if eq_ignore_case_3(&cmd[..3], b"mse") && (cmd[3] | 0x20) == b't' {
                 handle_mset(store, command, writer, now);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h' {
@@ -225,18 +252,14 @@ fn execute_command(
                 return;
             }
             if cmd.len() == 4 {
-                let lower = [
-                    cmd[0] | 0x20,
-                    cmd[1] | 0x20,
-                    cmd[2] | 0x20,
-                    cmd[3] | 0x20,
-                ];
+                let lower = [cmd[0] | 0x20, cmd[1] | 0x20, cmd[2] | 0x20, cmd[3] | 0x20];
                 if &lower == b"scan" {
                     handle_scan(store, command, writer, now);
                     return;
                 }
                 if &lower == b"hset" {
                     handle_hset(store, command, writer, now);
+                    aof_log(command);
                     return;
                 }
                 if &lower == b"hget" {
@@ -245,6 +268,7 @@ fn execute_command(
                 }
                 if &lower == b"hdel" {
                     handle_hdel(store, command, writer, now);
+                    aof_log(command);
                     return;
                 }
                 if &lower == b"type" {
@@ -306,14 +330,17 @@ fn execute_command(
             }
             if eq_ignore_case_6(cmd, b"incrby") {
                 handle_incrby(store, command, writer, now);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_6(cmd, b"decrby") {
                 handle_decrby(store, command, writer, now);
+                aof_log(command);
                 return;
             }
             if eq_ignore_case_6(cmd, b"expire") {
                 handle_expire(store, command, writer, now);
+                aof_log(command);
                 return;
             }
         }
@@ -338,14 +365,15 @@ fn execute_command(
                             let (key, val) = entry.pair();
                             // Only count non-expired keys (expired keys already have memory freed)
                             if val.expiry.is_none_or(|exp| now < exp) {
-                                actual_memory += store::calculate_entry_size(key.len(), &val.value) as u64;
+                                actual_memory +=
+                                    store::calculate_entry_size(key.len(), &val.value) as u64;
                             }
                         }
                     }
-                    
+
                     // Clear the store first
                     store.clear();
-                    
+
                     // Now subtract the calculated memory using CAS to handle concurrent operations
                     // We need to handle the case where other threads modified MEMORY_USED
                     // between our calculation and the subtraction
@@ -354,13 +382,24 @@ fn execute_command(
                         if actual_memory >= current {
                             // Calculated memory >= current (concurrent operations freed more than we calculated)
                             // Set to 0 to avoid underflow - any extra was from concurrent operations
-                            if MEMORY_USED.compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                            if MEMORY_USED
+                                .compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
                                 break;
                             }
                         } else {
                             // Normal case: subtract what we calculated
                             let new_value = current - actual_memory;
-                            if MEMORY_USED.compare_exchange(current, new_value, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                            if MEMORY_USED
+                                .compare_exchange(
+                                    current,
+                                    new_value,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
                                 break;
                             }
                         }
@@ -375,6 +414,7 @@ fn execute_command(
                 }
                 if &lower == b"persist" {
                     handle_persist(store, command, writer, now);
+                    aof_log(command);
                     return;
                 }
                 if &lower == b"hgetall" {
@@ -409,14 +449,15 @@ fn execute_command(
                             let (key, val) = entry.pair();
                             // Only count non-expired keys (expired keys already have memory freed)
                             if val.expiry.is_none_or(|exp| now < exp) {
-                                actual_memory += store::calculate_entry_size(key.len(), &val.value) as u64;
+                                actual_memory +=
+                                    store::calculate_entry_size(key.len(), &val.value) as u64;
                             }
                         }
                     }
-                    
+
                     // Clear the store first
                     store.clear();
-                    
+
                     // Now subtract the calculated memory using CAS to handle concurrent operations
                     // We need to handle the case where other threads modified MEMORY_USED
                     // between our calculation and the subtraction
@@ -425,13 +466,24 @@ fn execute_command(
                         if actual_memory >= current {
                             // Calculated memory >= current (concurrent operations freed more than we calculated)
                             // Set to 0 to avoid underflow - any extra was from concurrent operations
-                            if MEMORY_USED.compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                            if MEMORY_USED
+                                .compare_exchange(current, 0, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
                                 break;
                             }
                         } else {
                             // Normal case: subtract what we calculated
                             let new_value = current - actual_memory;
-                            if MEMORY_USED.compare_exchange(current, new_value, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                            if MEMORY_USED
+                                .compare_exchange(
+                                    current,
+                                    new_value,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
                                 break;
                             }
                         }
@@ -442,10 +494,54 @@ fn execute_command(
                 }
             }
         }
+        12 => {
+            // BGREWRITEAOF — background AOF compaction. 12 chars, case-insensitive.
+            let mut lower = [0u8; 12];
+            for i in 0..12 {
+                lower[i] = cmd[i] | 0x20;
+            }
+            if &lower == b"bgrewriteaof" {
+                handle_bgrewriteaof(store, writer);
+                return;
+            }
+        }
         _ => {}
     }
 
     writer.write_error(b"unknown command");
+}
+
+/// Trigger an async AOF rewrite. Replies immediately; the actual rewrite runs
+/// on a blocking task. Errors out if AOF is disabled or a rewrite is in flight.
+fn handle_bgrewriteaof(store: &ShardedStore, writer: &mut RespWriter) {
+    let Some(aof) = AOF.get() else {
+        writer.write_error(b"AOF is disabled");
+        return;
+    };
+    if aof.is_rewriting() {
+        writer.write_error(b"Background append only file rewriting already in progress");
+        return;
+    }
+    let aof_c = aof.clone();
+    let store_c = store.clone();
+    // Best effort: only succeeds if a tokio runtime is attached to the calling
+    // thread. In our server that is always the case.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || match aof_c.rewrite(&store_c) {
+                Ok(Some(stats)) => eprintln!(
+                    "AOF rewrite: {} keys, {} -> {} bytes",
+                    stats.keys_written, stats.previous_bytes, stats.bytes_written
+                ),
+                Ok(None) => {} // concurrent rewrite won the race
+                Err(e) => eprintln!("AOF rewrite failed: {}", e),
+            });
+            writer.write_simple_string(b"Background append only file rewriting started");
+        }
+        Err(_) => {
+            writer.write_error(b"internal error: no tokio runtime");
+        }
+    }
 }
 
 // ==================== Command Handlers ====================
@@ -687,7 +783,9 @@ fn handle_incr(
             let string_value = match &entry.value {
                 EntryValue::String(bytes) => bytes,
                 EntryValue::Hash(_) => {
-                    writer.write_error(b"WRONGTYPE Operation against a key holding the wrong kind of value");
+                    writer.write_error(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                     return;
                 }
             };
@@ -757,7 +855,7 @@ fn handle_incr(
 
     let val_bytes = Bytes::from(new_val.to_string());
     let size = entry_size(key.len(), val_bytes.len());
-    
+
     let net_size = size.saturating_sub(old_size_for_eviction);
 
     if net_size > 0 && !evict_if_needed(store, net_size) {
@@ -845,7 +943,7 @@ fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
         let key = &command[1 + i * 2];
         let value = &command[2 + i * 2];
         let new_size = entry_size(key.len(), value.len()) as i64;
-        
+
         // Check if key exists and get old size
         let old_size = store.get_existing_size(key, now).unwrap_or(0) as i64;
         net_size += new_size - old_size;
@@ -1354,6 +1452,82 @@ async fn main() {
         }
     }
 
+    // Load AOF (after RDB so its tail overrides). Also opens the file for
+    // append so later writes land on disk per the fsync policy.
+    if config.persistence.aof_enabled {
+        let fsync_policy = match aof::FsyncPolicy::parse(&config.persistence.aof_fsync) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("AOF config error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let aof_path = std::path::Path::new(&config.persistence.aof_path);
+
+        // Replay existing file (if any) before we start appending. We dispatch
+        // through execute_command so replay uses the same code path as live
+        // writes — no duplicated semantics.
+        print!("Loading AOF from {}... ", config.persistence.aof_path);
+        match aof::CommandReader::open(aof_path) {
+            Ok(Some(mut reader)) => {
+                let mut replayed: u64 = 0;
+                let mut scratch = RespWriter::new();
+                let mut replay_state = ConnectionState {
+                    authenticated: true,
+                };
+                let replay_now = get_timestamp();
+                loop {
+                    match reader.next_command() {
+                        Ok(Some(cmd)) => {
+                            scratch.clear();
+                            execute_command(
+                                &store,
+                                &cmd,
+                                &mut scratch,
+                                &mut replay_state,
+                                replay_now,
+                            );
+                            replayed += 1;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!("\nAOF malformed after {} commands: {}", replayed, e);
+                            eprintln!(
+                                "Refusing to start with a corrupt AOF. Fix the file or remove it."
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                println!("replayed {} commands", replayed);
+            }
+            Ok(None) => println!("no AOF found"),
+            Err(e) => {
+                eprintln!("failed to open AOF: {}", e);
+                std::process::exit(1);
+            }
+        }
+
+        // Now open for append and install the global.
+        match aof::Aof::open(aof_path, fsync_policy) {
+            Ok(a) => {
+                if AOF.set(Arc::new(a)).is_err() {
+                    eprintln!("AOF global already initialized (should be impossible)");
+                    std::process::exit(1);
+                }
+                println!(
+                    "AOF enabled (path: {}, fsync: {})",
+                    config.persistence.aof_path,
+                    fsync_policy.as_str()
+                );
+            }
+            Err(e) => {
+                eprintln!("failed to open AOF for append: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Load TLS configuration if enabled
     let tls_acceptor = if config.security.tls_enabled {
         if config.security.tls_cert_path.is_empty() || config.security.tls_key_path.is_empty() {
@@ -1439,6 +1613,30 @@ async fn main() {
     } else {
         None
     };
+
+    // Start AOF everysec background fsync task if that policy is selected.
+    let aof_everysec_handle = if let Some(aof_handle) = AOF.get()
+        && aof_handle.fsync_policy() == aof::FsyncPolicy::EverySec
+    {
+        Some(tokio::spawn(aof::everysec_task(
+            aof_handle.clone(),
+            shutdown_tx.subscribe(),
+        )))
+    } else {
+        None
+    };
+
+    // Start AOF auto-rewrite supervisor. Silently does nothing when
+    // aof_rewrite_percentage == 0 or AOF is disabled.
+    let aof_rewrite_handle = AOF.get().map(|aof_handle| {
+        tokio::spawn(aof::rewrite_supervisor_task(
+            aof_handle.clone(),
+            store.clone(),
+            config.persistence.aof_rewrite_min_size,
+            config.persistence.aof_rewrite_percentage,
+            shutdown_tx.subscribe(),
+        ))
+    });
 
     println!();
 
@@ -1537,15 +1735,18 @@ async fn main() {
             conn_set.abort_all();
             break;
         }
-        match tokio::time::timeout(remaining.min(Duration::from_millis(250)), conn_set.join_next())
-            .await
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(250)),
+            conn_set.join_next(),
+        )
+        .await
         {
             Ok(Some(_)) => {
                 if conn_set.is_empty() {
                     break;
                 }
             }
-            Ok(None) => break, // set is empty
+            Ok(None) => break,  // set is empty
             Err(_) => continue, // polling slice expired, re-check force_exit / deadline
         }
     }
@@ -1561,6 +1762,26 @@ async fn main() {
     }
     if let Some(h) = health_task {
         let _ = tokio::time::timeout(bg_timeout, h).await;
+    }
+    if let Some(h) = aof_everysec_handle {
+        // The task runs a final sync on shutdown_rx.changed() before exiting.
+        let _ = tokio::time::timeout(bg_timeout, h).await;
+    }
+    if let Some(h) = aof_rewrite_handle {
+        let _ = tokio::time::timeout(bg_timeout, h).await;
+    }
+
+    // Final AOF flush. The everysec task already fsynced; for "always" the
+    // hot path syncs on every write; for "no" we still want buffered bytes
+    // to land on disk before we exit.
+    if let Some(aof_handle) = AOF.get() {
+        let aof_clone = aof_handle.clone();
+        let sync_res = tokio::task::spawn_blocking(move || aof_clone.sync()).await;
+        match sync_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("final AOF sync failed: {}", e),
+            Err(e) => eprintln!("final AOF sync task panicked: {}", e),
+        }
     }
 
     // Final snapshot on shutdown, attempted even on force-exit.

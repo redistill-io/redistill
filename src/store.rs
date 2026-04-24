@@ -7,11 +7,11 @@ use bytes::Bytes;
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{CONFIG, EvictionPolicy};
@@ -29,9 +29,8 @@ pub static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 pub static SERVER_START_TIME: Lazy<u64> = Lazy::new(get_timestamp);
 
 // Cached eviction policy (parsed once at startup, avoids string parsing on hot path)
-pub static EVICTION_POLICY: Lazy<EvictionPolicy> = Lazy::new(|| {
-    CONFIG.memory.eviction_policy.parse().unwrap_or_default()
-});
+pub static EVICTION_POLICY: Lazy<EvictionPolicy> =
+    Lazy::new(|| CONFIG.memory.eviction_policy.parse().unwrap_or_default());
 
 // ==================== Buffer Pool ====================
 
@@ -57,7 +56,9 @@ pub fn return_buffer(mut buf: Vec<u8>) {
     // This prevents pool draining while avoiding unbounded memory growth
     if buf.capacity() <= CONFIG.server.buffer_size * 2 {
         BUFFER_POOL.push(buf);
-    } else if buf.capacity() <= CONFIG.server.buffer_size * 4 && BUFFER_POOL.len() < CONFIG.server.buffer_pool_size / 4 {
+    } else if buf.capacity() <= CONFIG.server.buffer_size * 4
+        && BUFFER_POOL.len() < CONFIG.server.buffer_pool_size / 4
+    {
         // Keep some larger buffers if pool is getting low, but cap at 25% of pool size
         BUFFER_POOL.push(buf);
     }
@@ -96,8 +97,8 @@ pub struct Entry {
     pub value: EntryValue,
     pub expiry: Option<u64>,
     pub last_accessed: AtomicU32,
-    pub queue_type: AtomicU8,      // 0=Small, 1=Main (only used for S3-FIFO)
-    pub access_count: AtomicU8,     // For Small queue promotion (only used for S3-FIFO)
+    pub queue_type: AtomicU8,   // 0=Small, 1=Main (only used for S3-FIFO)
+    pub access_count: AtomicU8, // For Small queue promotion (only used for S3-FIFO)
 }
 
 impl Clone for Entry {
@@ -122,12 +123,12 @@ struct GhostEntry {
 
 pub struct S3FifoQueues {
     small_queue: VecDeque<Bytes>,      // Keys in Small queue
-    main_queue: VecDeque<Bytes>,        // Keys in Main queue
-    ghost_queue: VecDeque<GhostEntry>,  // Metadata only
-    ghost_set: ahash::AHashSet<u64>,    // Fast lookup for ghost entries
+    main_queue: VecDeque<Bytes>,       // Keys in Main queue
+    ghost_queue: VecDeque<GhostEntry>, // Metadata only
+    ghost_set: ahash::AHashSet<u64>,   // Fast lookup for ghost entries
     // HashSets for O(1) membership check before O(n) removal
-    small_set: ahash::AHashSet<Bytes>,  // Fast lookup for Small queue
-    main_set: ahash::AHashSet<Bytes>,   // Fast lookup for Main queue
+    small_set: ahash::AHashSet<Bytes>, // Fast lookup for Small queue
+    main_set: ahash::AHashSet<Bytes>,  // Fast lookup for Main queue
     small_capacity: usize,
     main_capacity: usize,
     ghost_capacity: usize,
@@ -147,7 +148,7 @@ impl S3FifoQueues {
             ghost_capacity,
         }
     }
-    
+
     // Optimized removal: O(1) check + O(n) removal only if needed
     fn remove_from_small(&mut self, key: &Bytes) -> bool {
         if self.small_set.remove(key) {
@@ -158,7 +159,7 @@ impl S3FifoQueues {
             false
         }
     }
-    
+
     fn remove_from_main(&mut self, key: &Bytes) -> bool {
         if self.main_set.remove(key) {
             // Only do O(n) retain if key was actually in set
@@ -168,12 +169,12 @@ impl S3FifoQueues {
             false
         }
     }
-    
+
     // Optimized: Check if key is already at tail (common case for reinsertion)
     fn is_main_tail(&self, key: &Bytes) -> bool {
         self.main_queue.back().map_or(false, |k| k == key)
     }
-    
+
     // Optimized reinsertion: Skip if already at tail, otherwise remove and reinsert
     fn reinsert_main_tail(&mut self, key: Bytes) {
         // Fast path: already at tail, nothing to do
@@ -186,7 +187,7 @@ impl S3FifoQueues {
         }
         self.add_to_main(key);
     }
-    
+
     fn add_to_small(&mut self, key: Bytes) {
         // Idempotency guard: if key is already in the queue, skip to prevent duplicates
         // under concurrent writes to the same key (two-phase S3-FIFO lock race)
@@ -204,7 +205,7 @@ impl S3FifoQueues {
         self.small_set.insert(key.clone());
         self.small_queue.push_back(key);
     }
-    
+
     fn add_to_main(&mut self, key: Bytes) {
         // Idempotency guard: if key is already in the queue, skip to prevent duplicates
         if self.main_set.contains(&key) {
@@ -252,7 +253,7 @@ impl S3FifoQueues {
 
 pub struct ShardedStore {
     pub shards: Vec<Arc<DashMap<Bytes, Entry>>>,
-    pub s3fifo_queues: Vec<Arc<RwLock<S3FifoQueues>>>,  // One per shard (only used for S3-FIFO)
+    pub s3fifo_queues: Vec<Arc<RwLock<S3FifoQueues>>>, // One per shard (only used for S3-FIFO)
     pub num_shards: usize,
 }
 
@@ -270,7 +271,7 @@ impl ShardedStore {
     pub fn new(num_shards: usize) -> Self {
         let mut shards = Vec::with_capacity(num_shards);
         let mut s3fifo_queues = Vec::with_capacity(num_shards);
-        
+
         // Calculate queue capacities based on max_memory per shard
         let max_memory = CONFIG.memory.max_memory;
         let (small_cap, main_cap, ghost_cap) = if max_memory > 0 {
@@ -285,13 +286,11 @@ impl ShardedStore {
             // Default sizes when no memory limit
             (100, 900, 100)
         };
-        
+
         for _ in 0..num_shards {
             shards.push(Arc::new(DashMap::with_capacity(1000)));
             s3fifo_queues.push(Arc::new(RwLock::new(S3FifoQueues::new(
-                small_cap,
-                main_cap,
-                ghost_cap,
+                small_cap, main_cap, ghost_cap,
             ))));
         }
         Self {
@@ -323,14 +322,14 @@ impl ShardedStore {
 
         // Check if using S3-FIFO policy (using cached policy to avoid string parsing)
         let policy = *EVICTION_POLICY;
-        
+
         // Remove old entry from queues if it exists and we're using S3-FIFO
         if policy == EvictionPolicy::AllKeysS3Fifo {
             if let Some(old_entry) = shard.get(&key) {
                 let old_queue_type = QueueType::from(old_entry.queue_type.load(Ordering::Relaxed));
                 let queues = &self.s3fifo_queues[shard_idx];
                 let mut queues_guard = queues.write().unwrap();
-                
+
                 match old_queue_type {
                     QueueType::Small => {
                         queues_guard.remove_from_small(&key);
@@ -342,16 +341,16 @@ impl ShardedStore {
                 drop(queues_guard);
             }
         }
-        
+
         let (queue_type, access_count) = if policy == EvictionPolicy::AllKeysS3Fifo {
             // Check Ghost queue to decide Small vs Main
             let queues = &self.s3fifo_queues[shard_idx];
             let mut queues_guard = queues.write().unwrap();
-            
+
             let mut hasher = AHasher::default();
             hasher.write(&key);
             let key_hash = hasher.finish();
-            
+
             let qtype = if queues_guard.is_in_ghost(key_hash) {
                 // Found in Ghost - insert to Main queue
                 queues_guard.remove_from_ghost(key_hash);
@@ -388,7 +387,9 @@ impl ShardedStore {
         let shard = &self.shards[self.hash(key)];
         if let Some(entry) = shard.get(key) {
             // Check if expired
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 return None;
             }
             return Some(calculate_entry_size(key.len(), &entry.value));
@@ -424,30 +425,32 @@ impl ShardedStore {
             }
 
             maybe_update_access_time(&entry);
-            
+
             // Handle S3-FIFO access tracking (using cached policy to avoid string parsing)
             let policy = *EVICTION_POLICY;
             if policy == EvictionPolicy::AllKeysS3Fifo {
                 let queue_type = QueueType::from(entry.queue_type.load(Ordering::Relaxed));
                 let key_bytes = Bytes::copy_from_slice(key);
-                
+
                 match queue_type {
                     QueueType::Small => {
                         // Increment access count
                         let access_count = entry.access_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        
+
                         // Promote to Main if accessed more than once
                         if access_count > 1 {
                             let queues = &self.s3fifo_queues[shard_idx];
                             let mut queues_guard = queues.write().unwrap();
-                            
+
                             // Remove from Small queue and add to Main
                             queues_guard.remove_from_small(&key_bytes);
                             queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
-                            
+
                             // Update entry queue type
-                            entry.queue_type.store(QueueType::Main as u8, Ordering::Relaxed);
+                            entry
+                                .queue_type
+                                .store(QueueType::Main as u8, Ordering::Relaxed);
                         }
                     }
                     QueueType::Main => {
@@ -459,7 +462,7 @@ impl ShardedStore {
                     }
                 }
             }
-            
+
             // Only return value if it's a string
             if let EntryValue::String(ref val) = entry.value {
                 return Some(val.clone());
@@ -511,14 +514,14 @@ impl ShardedStore {
         for key in keys {
             let shard_idx = self.hash(key);
             let shard = &self.shards[shard_idx];
-            
+
             // Remove from S3-FIFO queues if using S3-FIFO
             if policy == EvictionPolicy::AllKeysS3Fifo {
                 if let Some(entry) = shard.get(key) {
                     let queue_type = QueueType::from(entry.queue_type.load(Ordering::Relaxed));
                     let queues = &self.s3fifo_queues[shard_idx];
                     let mut queues_guard = queues.write().unwrap();
-                    
+
                     match queue_type {
                         QueueType::Small => {
                             queues_guard.remove_from_small(key);
@@ -530,7 +533,7 @@ impl ShardedStore {
                     drop(queues_guard);
                 }
             }
-            
+
             if let Some((_, entry)) = shard.remove(key) {
                 // Always decrement memory if key was removed, regardless of expiry
                 // (expired keys still consume memory until removed)
@@ -600,7 +603,7 @@ impl ShardedStore {
         // Iterate through shards starting from cursor position
         let mut current_shard = start_shard;
         let mut current_position = start_position;
-        
+
         while current_shard < self.num_shards {
             let shard = &self.shards[current_shard];
             let entries: Vec<_> = shard.iter().collect(); // Collect to avoid holding lock during processing
@@ -639,7 +642,7 @@ impl ShardedStore {
 
                 result.push(key.clone());
             }
-            
+
             // Move to next shard
             current_shard += 1;
             current_position = 0;
@@ -668,7 +671,12 @@ impl ShardedStore {
 
     /// Set one or more field-value pairs in a hash
     /// Returns the number of fields that were newly set (not updated)
-    pub fn hset(&self, key: Bytes, fields: &[(Bytes, Bytes)], now: u64) -> Result<usize, &'static str> {
+    pub fn hset(
+        &self,
+        key: Bytes,
+        fields: &[(Bytes, Bytes)],
+        now: u64,
+    ) -> Result<usize, &'static str> {
         let key_len = key.len();
         let shard_idx = self.hash(&key);
         let shard = &self.shards[shard_idx];
@@ -689,11 +697,14 @@ impl ShardedStore {
             match shard.entry(key.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(occ) => {
                     let entry = occ.get();
-                    if let Some(expiry) = entry.expiry && now >= expiry {
+                    if let Some(expiry) = entry.expiry
+                        && now >= expiry
+                    {
                         let size = calculate_entry_size(key_len, &entry.value);
 
                         if policy == EvictionPolicy::AllKeysS3Fifo {
-                            let old_queue_type = QueueType::from(entry.queue_type.load(Ordering::Relaxed));
+                            let old_queue_type =
+                                QueueType::from(entry.queue_type.load(Ordering::Relaxed));
                             let queues = &self.s3fifo_queues[shard_idx];
                             let mut queues_guard = queues.write().unwrap();
                             match old_queue_type {
@@ -715,7 +726,9 @@ impl ShardedStore {
                             break hash.clone();
                         }
                         EntryValue::String(_) => {
-                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
                         }
                     }
                 }
@@ -797,7 +810,9 @@ impl ShardedStore {
         let shard = &self.shards[shard_idx];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 let key_bytes = Bytes::copy_from_slice(key);
                 drop(entry);
 
@@ -815,13 +830,13 @@ impl ShardedStore {
             }
 
             maybe_update_access_time(&entry);
-            
+
             // Handle S3-FIFO access tracking (same logic as get(), using cached policy)
             let policy = *EVICTION_POLICY;
             if policy == EvictionPolicy::AllKeysS3Fifo {
                 let queue_type = QueueType::from(entry.queue_type.load(Ordering::Relaxed));
                 let key_bytes = Bytes::copy_from_slice(key);
-                
+
                 match queue_type {
                     QueueType::Small => {
                         let access_count = entry.access_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -831,7 +846,9 @@ impl ShardedStore {
                             queues_guard.remove_from_small(&key_bytes);
                             queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
-                            entry.queue_type.store(QueueType::Main as u8, Ordering::Relaxed);
+                            entry
+                                .queue_type
+                                .store(QueueType::Main as u8, Ordering::Relaxed);
                         }
                     }
                     QueueType::Main => {
@@ -863,7 +880,9 @@ impl ShardedStore {
         let shard = &self.shards[shard_idx];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 let key_bytes = Bytes::copy_from_slice(key);
                 drop(entry);
 
@@ -881,13 +900,13 @@ impl ShardedStore {
             }
 
             maybe_update_access_time(&entry);
-            
+
             // Handle S3-FIFO access tracking (same logic as get(), using cached policy)
             let policy = *EVICTION_POLICY;
             if policy == EvictionPolicy::AllKeysS3Fifo {
                 let queue_type = QueueType::from(entry.queue_type.load(Ordering::Relaxed));
                 let key_bytes = Bytes::copy_from_slice(key);
-                
+
                 match queue_type {
                     QueueType::Small => {
                         let access_count = entry.access_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -897,7 +916,9 @@ impl ShardedStore {
                             queues_guard.remove_from_small(&key_bytes);
                             queues_guard.add_to_main(key_bytes.clone());
                             drop(queues_guard);
-                            entry.queue_type.store(QueueType::Main as u8, Ordering::Relaxed);
+                            entry
+                                .queue_type
+                                .store(QueueType::Main as u8, Ordering::Relaxed);
                         }
                     }
                     QueueType::Main => {
@@ -936,7 +957,9 @@ impl ShardedStore {
         let shard = &self.shards[shard_idx];
 
         if let Some(entry) = shard.get(key) {
-            if let Some(expiry) = entry.expiry && now >= expiry {
+            if let Some(expiry) = entry.expiry
+                && now >= expiry
+            {
                 let key_bytes = Bytes::copy_from_slice(key);
                 drop(entry);
 
@@ -979,9 +1002,7 @@ impl ShardedStore {
 
                             if let Some((_, removed_entry)) =
                                 shard.remove_if(&key_bytes, |_, v| match &v.value {
-                                    EntryValue::Hash(h) => {
-                                        h.read().map_or(false, |g| g.is_empty())
-                                    }
+                                    EntryValue::Hash(h) => h.read().map_or(false, |g| g.is_empty()),
                                     _ => false,
                                 })
                             {
@@ -1008,7 +1029,8 @@ impl ShardedStore {
                             // Recalculate size after field removal
                             let new_size = calculate_entry_size(key_len, &entry.value);
                             if old_size > new_size {
-                                MEMORY_USED.fetch_sub((old_size - new_size) as u64, Ordering::Relaxed);
+                                MEMORY_USED
+                                    .fetch_sub((old_size - new_size) as u64, Ordering::Relaxed);
                             }
                         }
                     }
@@ -1194,14 +1216,14 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
         let shard_idx = fastrand::usize(..store.num_shards);
         let shard = &store.shards[shard_idx];
         let queues = &store.s3fifo_queues[shard_idx];
-        
+
         // Try to evict from Small queue first
         let mut evicted_key: Option<Bytes> = None;
         let mut from_small = false;
-        
+
         {
             let mut queues_guard = queues.write().unwrap();
-            
+
             // Try Small queue first (FIFO - remove from front)
             if let Some(key) = queues_guard.small_queue.pop_front() {
                 queues_guard.small_set.remove(&key);
@@ -1213,7 +1235,7 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
                 evicted_key = Some(key);
                 from_small = false;
             }
-            
+
             // If we found a key to evict from Small, add to Ghost
             if let Some(ref key) = evicted_key {
                 if from_small {
@@ -1224,7 +1246,7 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
                 }
             }
         }
-        
+
         // Now remove from the actual store
         if let Some(key) = evicted_key {
             let key_len = key.len();
@@ -1236,7 +1258,7 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
             }
         }
     }
-    
+
     0
 }
 
@@ -1255,7 +1277,7 @@ pub fn expire_random_keys(store: &ShardedStore, count: usize) -> usize {
             continue;
         }
         let skip = fastrand::usize(..len);
-        
+
         if let Some(entry) = shard.iter().nth(skip)
             && let Some(expiry) = entry.value().expiry
             && now >= expiry

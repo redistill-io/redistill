@@ -53,6 +53,11 @@ enabled = false
 snapshot_path = "redistill.rdb"
 snapshot_interval = 300
 save_on_shutdown = true
+aof_enabled = false
+aof_path = "redistill.aof"
+aof_fsync = "everysec"
+aof_rewrite_min_size = 67108864
+aof_rewrite_percentage = 100
 ```
 
 ## Configuration Sections
@@ -108,10 +113,15 @@ save_on_shutdown = true
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enabled` | boolean | false | Enable snapshot-based persistence (disabled by default for max speed) |
+| `enabled` | boolean | false | Enable RDB snapshot-based persistence (disabled by default for max speed) |
 | `snapshot_path` | string | "redistill.rdb" | Path to snapshot file |
 | `snapshot_interval` | integer | 300 | Auto-save interval in seconds (0 = disabled, default: 300 = 5 min) |
 | `save_on_shutdown` | boolean | true | Save snapshot on graceful shutdown (SIGTERM/Ctrl+C) |
+| `aof_enabled` | boolean | false | Enable AOF (append-only file). Independent of RDB — enable either, both, or neither. |
+| `aof_path` | string | "redistill.aof" | Path to AOF file |
+| `aof_fsync` | string | "everysec" | Fsync policy: `"always"` (per-write), `"everysec"` (1s window), `"no"` (rely on OS) |
+| `aof_rewrite_min_size` | integer | 67108864 | Minimum AOF size (bytes) before auto-rewrite is considered (default: 64 MiB) |
+| `aof_rewrite_percentage` | integer | 100 | Trigger auto-rewrite when log has grown this % past its last-rewrite size (0 = manual only) |
 
 ## Environment Variables
 
@@ -138,6 +148,11 @@ Environment variables override configuration file settings:
 | `REDIS_SNAPSHOT_INTERVAL` | `persistence.snapshot_interval` | `REDIS_SNAPSHOT_INTERVAL=600` |
 | `REDIS_SAVE_ON_SHUTDOWN` | `persistence.save_on_shutdown` | `REDIS_SAVE_ON_SHUTDOWN=true` |
 | `REDIS_SHUTDOWN_GRACE_SECS` | `server.shutdown_grace_period_secs` | `REDIS_SHUTDOWN_GRACE_SECS=30` |
+| `REDIS_AOF_ENABLED` | `persistence.aof_enabled` | `REDIS_AOF_ENABLED=true` |
+| `REDIS_AOF_PATH` | `persistence.aof_path` | `REDIS_AOF_PATH=/data/redistill.aof` |
+| `REDIS_AOF_FSYNC` | `persistence.aof_fsync` | `REDIS_AOF_FSYNC=everysec` |
+| `REDIS_AOF_REWRITE_MIN_SIZE` | `persistence.aof_rewrite_min_size` | `REDIS_AOF_REWRITE_MIN_SIZE=67108864` |
+| `REDIS_AOF_REWRITE_PERCENTAGE` | `persistence.aof_rewrite_percentage` | `REDIS_AOF_REWRITE_PERCENTAGE=100` |
 
 ## Example Configurations
 

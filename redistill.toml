@@ -51,8 +51,19 @@ eviction_policy = "allkeys-lru"   # Policy when memory limit reached:
 eviction_sample_size = 5          # Number of keys to sample for eviction (higher = better decisions)
 
 [persistence]
-enabled = false                   # Enable persistence (default: false for max speed)
+# RDB (point-in-time snapshots)
+enabled = false                   # Enable RDB snapshots (default: false for max speed)
 snapshot_path = "redistill.rdb"   # Path to snapshot file
 snapshot_interval = 300           # Auto-save interval in seconds (0 = disabled, default: 300 = 5 min)
 save_on_shutdown = true           # Save snapshot on graceful shutdown (SIGTERM/Ctrl+C)
+
+# AOF (append-only file, independent of RDB — enable either, both, or neither)
+aof_enabled = true               # Log every write command to an append-only file
+aof_path = "redistill.aof"        # Path to AOF file
+aof_fsync = "everysec"            # "always" (per-write, slowest/safest) | "everysec" (default, 1s window) | "no" (rely on OS)
+
+# AOF compaction (a.k.a. rewrite) — rewrites the log as a minimal SET/HSET per
+# live key so it doesn't grow forever.
+aof_rewrite_min_size = 67108864   # 64 MiB: don't bother rewriting below this
+aof_rewrite_percentage = 100      # rewrite when log is this % larger than after last rewrite (0 = manual only)
 

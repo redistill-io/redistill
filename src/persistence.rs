@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::CONFIG;
-use crate::store::{Entry, EntryValue, MEMORY_USED, ShardedStore, calculate_entry_size, get_timestamp};
+use crate::store::{
+    Entry, EntryValue, MEMORY_USED, ShardedStore, calculate_entry_size, get_timestamp,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -241,7 +243,9 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
         };
 
         // Skip expired entries
-        if let Some(exp) = expiry && now >= exp {
+        if let Some(exp) = expiry
+            && now >= exp
+        {
             skipped_expired += 1;
             continue;
         }

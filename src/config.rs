@@ -85,6 +85,23 @@ pub struct PersistenceConfig {
     pub save_on_shutdown: bool,
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval: u64,
+    /// Enable AOF (append-only file) persistence. Independent of RDB.
+    #[serde(default)]
+    pub aof_enabled: bool,
+    #[serde(default = "default_aof_path")]
+    pub aof_path: String,
+    /// fsync policy: "always" | "everysec" | "no". Default "everysec".
+    #[serde(default = "default_aof_fsync")]
+    pub aof_fsync: String,
+    /// Minimum AOF size (bytes) before auto-rewrite is considered. Default 64 MiB.
+    /// Smaller files aren't worth the stop-the-world pause.
+    #[serde(default = "default_aof_rewrite_min_size")]
+    pub aof_rewrite_min_size: u64,
+    /// Trigger auto-rewrite when the AOF has grown by this many percent past
+    /// its size at the last rewrite. 0 disables automatic rewrite (manual
+    /// BGREWRITEAOF only). Default 100 (rewrite when log has doubled).
+    #[serde(default = "default_aof_rewrite_percentage")]
+    pub aof_rewrite_percentage: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,6 +179,18 @@ fn default_snapshot_path() -> String {
 fn default_snapshot_interval() -> u64 {
     300
 }
+fn default_aof_path() -> String {
+    "redistill.aof".to_string()
+}
+fn default_aof_fsync() -> String {
+    "everysec".to_string()
+}
+fn default_aof_rewrite_min_size() -> u64 {
+    64 * 1024 * 1024 // 64 MiB
+}
+fn default_aof_rewrite_percentage() -> u64 {
+    100
+}
 
 // ==================== Default Implementations ====================
 
@@ -220,6 +249,11 @@ impl Default for PersistenceConfig {
             snapshot_path: default_snapshot_path(),
             save_on_shutdown: true,
             snapshot_interval: default_snapshot_interval(),
+            aof_enabled: false,
+            aof_path: default_aof_path(),
+            aof_fsync: default_aof_fsync(),
+            aof_rewrite_min_size: default_aof_rewrite_min_size(),
+            aof_rewrite_percentage: default_aof_rewrite_percentage(),
         }
     }
 }
@@ -370,6 +404,30 @@ impl Config {
             && let Ok(g) = grace.parse()
         {
             config.server.shutdown_grace_period_secs = g;
+        }
+
+        if let Ok(aof_enabled) = std::env::var("REDIS_AOF_ENABLED") {
+            config.persistence.aof_enabled = aof_enabled.parse().unwrap_or(false);
+        }
+
+        if let Ok(aof_path) = std::env::var("REDIS_AOF_PATH") {
+            config.persistence.aof_path = aof_path;
+        }
+
+        if let Ok(aof_fsync) = std::env::var("REDIS_AOF_FSYNC") {
+            config.persistence.aof_fsync = aof_fsync;
+        }
+
+        if let Ok(s) = std::env::var("REDIS_AOF_REWRITE_MIN_SIZE")
+            && let Ok(v) = s.parse()
+        {
+            config.persistence.aof_rewrite_min_size = v;
+        }
+
+        if let Ok(s) = std::env::var("REDIS_AOF_REWRITE_PERCENTAGE")
+            && let Ok(v) = s.parse()
+        {
+            config.persistence.aof_rewrite_percentage = v;
         }
 
         config.validate()?;
