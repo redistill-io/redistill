@@ -58,6 +58,12 @@ aof_path = "redistill.aof"
 aof_fsync = "everysec"
 aof_rewrite_min_size = 67108864
 aof_rewrite_percentage = 100
+
+[replication]
+replicaof = ""
+masterauth = ""
+replica_read_only = true
+repl_backlog_size = 1048576
 ```
 
 ## Configuration Sections
@@ -123,6 +129,17 @@ aof_rewrite_percentage = 100
 | `aof_rewrite_min_size` | integer | 67108864 | Minimum AOF size (bytes) before auto-rewrite is considered (default: 64 MiB) |
 | `aof_rewrite_percentage` | integer | 100 | Trigger auto-rewrite when log has grown this % past its last-rewrite size (0 = manual only) |
 
+### Replication Configuration
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `replicaof` | string | `""` | `"host:port"` of a Redistill primary; empty means primary role |
+| `masterauth` | string | `""` | Password for authenticating to the primary |
+| `replica_read_only` | boolean | true | Reject client writes on the replica |
+| `repl_backlog_size` | integer | 1048576 | Live broadcast buffer capacity in commands; lagged replicas reconnect and full-sync |
+
+Replication is asynchronous, Redistill-to-Redistill, and full-sync-only. Promotion uses `REPLICAOF NO ONE`; failover is manual and may lose recent writes. The outbound replica connection is plain TCP and cannot connect directly to a TLS-only primary. Use a trusted private network or TLS tunnel for replication traffic, especially when `masterauth` is configured.
+
 ## Environment Variables
 
 Environment variables override configuration file settings:
@@ -153,6 +170,10 @@ Environment variables override configuration file settings:
 | `REDIS_AOF_FSYNC` | `persistence.aof_fsync` | `REDIS_AOF_FSYNC=everysec` |
 | `REDIS_AOF_REWRITE_MIN_SIZE` | `persistence.aof_rewrite_min_size` | `REDIS_AOF_REWRITE_MIN_SIZE=67108864` |
 | `REDIS_AOF_REWRITE_PERCENTAGE` | `persistence.aof_rewrite_percentage` | `REDIS_AOF_REWRITE_PERCENTAGE=100` |
+| `REDIS_REPLICAOF` | `replication.replicaof` | `REDIS_REPLICAOF=primary:6379` |
+| `REDIS_MASTERAUTH` | `replication.masterauth` | `REDIS_MASTERAUTH=secret` |
+| `REDIS_REPLICA_READ_ONLY` | `replication.replica_read_only` | `REDIS_REPLICA_READ_ONLY=true` |
+| `REDIS_REPL_BACKLOG_SIZE` | `replication.repl_backlog_size` | `REDIS_REPL_BACKLOG_SIZE=1048576` |
 
 ## Example Configurations
 

@@ -54,6 +54,10 @@ pub struct Replication {
     /// Guards (offset increment + broadcast send) so frame offsets are
     /// monotonic and consistent with broadcast order.
     feed_lock: Mutex<()>,
+    /// Serializes write execution with propagation while a replica is attached.
+    /// Without this, two concurrent writers can mutate in one order and publish
+    /// their commands in the opposite order.
+    pub write_order: Mutex<()>,
     sender: broadcast::Sender<Frame>,
     /// Held shared by every command; held exclusively during a full-sync cut so
     /// the snapshot is quiescent and aligns with a single offset.
@@ -75,6 +79,7 @@ impl Replication {
             replid: RwLock::new(gen_replid()),
             offset: AtomicU64::new(0),
             feed_lock: Mutex::new(()),
+            write_order: Mutex::new(()),
             sender,
             barrier: RwLock::new(()),
             replica_count: AtomicU64::new(0),
@@ -113,6 +118,10 @@ impl Replication {
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
         self.sender.subscribe()
+    }
+
+    pub fn has_subscribers(&self) -> bool {
+        self.sender.receiver_count() > 0
     }
 
     /// Current replica "generation"; bumped whenever the master target changes
@@ -209,6 +218,10 @@ pub async fn serve_replica<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    if repl.role() != Role::Primary {
+        return Err(std::io::Error::other("node is no longer a primary"));
+    }
+    let role_rx = repl.gen_subscribe();
     // --- Consistency cut: exclusive barrier => quiescent store + single offset.
     // All sync work; the guard is dropped at the end of this block, before any await.
     let (snapshot, cut_offset, replid, mut rx) = {
@@ -230,26 +243,32 @@ where
     stream.flush().await?;
 
     repl.incr_replicas();
-    let result = stream_loop(&mut rx, cut_offset, stream, shutdown_rx).await;
+    let result = stream_loop(repl, &mut rx, cut_offset, stream, shutdown_rx, role_rx).await;
     repl.decr_replicas();
     result
 }
 
 async fn stream_loop<S>(
+    repl: &Replication,
     rx: &mut broadcast::Receiver<Frame>,
     cut_offset: u64,
     stream: &mut S,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut role_rx: watch::Receiver<u64>,
 ) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     loop {
+        if repl.role() != Role::Primary {
+            return Err(std::io::Error::other("primary became a replica"));
+        }
         let recv = tokio::select! {
             biased;
             // On shutdown, close the stream promptly so the replica sees EOF and
             // fails over / reconnects, instead of waiting out the drain window.
             _ = shutdown_rx.changed() => return Ok(()),
+            _ = role_rx.changed() => continue,
             r = rx.recv() => r,
         };
         match recv {
@@ -355,9 +374,8 @@ pub async fn replica_client(
     masterauth: String,
     listening_port: u16,
     my_gen: u64,
-    clear: impl Fn() + Send + Sync,
-    load: impl Fn(&[u8]) + Send + Sync,
-    apply: impl Fn(Vec<Bytes>) + Send + Sync,
+    install: impl Fn(&[u8], u64) -> std::io::Result<()> + Send + Sync,
+    apply: impl Fn(Vec<Bytes>, u64) -> bool + Send + Sync,
 ) {
     let mut gen_rx = repl.gen_subscribe();
     let mut backoff = Duration::from_millis(200);
@@ -366,16 +384,7 @@ pub async fn replica_client(
         if repl.current_gen() != my_gen {
             return;
         }
-        let sync = connect_and_sync(
-            &repl,
-            &host,
-            port,
-            &masterauth,
-            listening_port,
-            &clear,
-            &load,
-            &apply,
-        );
+        let sync = connect_and_sync(&host, port, &masterauth, listening_port, &install, &apply);
         tokio::select! {
             res = sync => {
                 match res {
@@ -390,7 +399,11 @@ pub async fn replica_client(
                 return;
             }
         }
-        repl.set_link_up(false);
+        let _order = repl.write_order.lock();
+        if repl.current_gen() == my_gen {
+            repl.set_link_up(false);
+        }
+        drop(_order);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
     }
@@ -398,14 +411,12 @@ pub async fn replica_client(
 
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_sync(
-    repl: &Replication,
     host: &str,
     port: u16,
     masterauth: &str,
     listening_port: u16,
-    clear: &(impl Fn() + Send + Sync),
-    load: &(impl Fn(&[u8]) + Send + Sync),
-    apply: &(impl Fn(Vec<Bytes>) + Send + Sync),
+    install: &(impl Fn(&[u8], u64) -> std::io::Result<()> + Send + Sync),
+    apply: &(impl Fn(Vec<Bytes>, u64) -> bool + Send + Sync),
 ) -> std::io::Result<()> {
     let stream = TcpStream::connect((host, port)).await?;
     let (rd, mut wr) = stream.into_split();
@@ -445,21 +456,17 @@ async fn connect_and_sync(
     }
     // +FULLRESYNC <replid> <offset> — adopt the master's offset so the replica's
     // INFO master_repl_offset reflects the stream position it starts from.
-    if let Some(off) = std::str::from_utf8(&fullresync)
+    let cut_offset = std::str::from_utf8(&fullresync)
         .ok()
         .and_then(|s| s.split_whitespace().nth(2))
         .and_then(|s| s.parse::<u64>().ok())
-    {
-        repl.set_offset(off);
-    }
+        .ok_or_else(|| std::io::Error::other("invalid FULLRESYNC offset"))?;
 
     // Snapshot: $<len>\r\n<bytes>  (no trailing CRLF).
     let len = read_bulk_len(&mut reader).await?;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    clear();
-    load(&buf);
-    repl.set_link_up(true);
+    install(&buf, cut_offset)?;
     eprintln!(
         "replication: full sync complete from {}:{} ({} bytes)",
         host, port, len
@@ -470,8 +477,9 @@ async fn connect_and_sync(
         match read_command(&mut reader).await? {
             Some(cmd) => {
                 let n = encode_command(&cmd).len() as u64;
-                apply(cmd);
-                repl.add_offset(n);
+                if !apply(cmd, n) {
+                    return Err(std::io::Error::other("replica stream superseded"));
+                }
             }
             None => return Ok(()),
         }

@@ -36,7 +36,7 @@ use tokio_rustls::TlsAcceptor;
 // Re-export from modules for internal use
 use config::{CONFIG, EvictionPolicy, format_bytes};
 use persistence::{
-    LAST_SAVE_TIME, SAVE_IN_PROGRESS, load_snapshot, load_store_from_bytes, save_snapshot_sync,
+    LAST_SAVE_TIME, SAVE_IN_PROGRESS, load_snapshot, replace_store_from_bytes, save_snapshot_sync,
     snapshot_task,
 };
 use protocol::{RespParser, RespWriter, eq_ignore_case_3, eq_ignore_case_6, parse_i64, parse_u64};
@@ -46,7 +46,7 @@ use server::{
 use store::{
     ACTIVE_CONNECTIONS, EVICTED_KEYS, EntryValue, MEMORY_USED, REJECTED_CONNECTIONS, ShardedStore,
     TOTAL_COMMANDS, TOTAL_CONNECTIONS, entry_size, evict_if_needed, expire_random_keys,
-    get_timestamp,
+    expire_random_keys_at, get_timestamp,
 };
 
 // Server start time for uptime tracking
@@ -93,6 +93,19 @@ fn on_write(command: &[Bytes]) {
     }
 }
 
+/// Eviction is a primary-side mutation, so each removed key must precede the
+/// command that needed the space in both the AOF and replication stream.
+fn allow_write_after_eviction(store: &ShardedStore, needed_size: usize) -> bool {
+    if repl().role() != replication::Role::Primary {
+        return true;
+    }
+    let outcome = evict_if_needed(store, needed_size);
+    for key in outcome.keys {
+        on_write(&[Bytes::from_static(b"DEL"), key]);
+    }
+    outcome.allowed
+}
+
 /// Commands that mutate state (must match the set of handlers that call `on_write`).
 fn is_write_command(cmd: &[u8]) -> bool {
     const WRITES: &[&[u8]] = &[
@@ -117,9 +130,10 @@ fn spawn_replica_task(store: ShardedStore, host: String, port: u16, generation: 
     let r = repl().clone();
     let masterauth = CONFIG.replication.masterauth.clone();
     let listening_port = CONFIG.server.port;
-    let clear_store = store.clone();
-    let load_store = store.clone();
+    let install_store = store.clone();
+    let install_repl = r.clone();
     let apply_store = store.clone();
+    let repl_apply = r.clone();
 
     tokio::spawn(async move {
         replication::replica_client(
@@ -129,13 +143,31 @@ fn spawn_replica_task(store: ShardedStore, host: String, port: u16, generation: 
             masterauth,
             listening_port,
             generation,
-            move || clear_store.clear(),
-            move |bytes: &[u8]| {
-                if let Err(e) = load_store_from_bytes(&load_store, bytes) {
-                    eprintln!("failed to load replica snapshot: {}", e);
+            move |bytes: &[u8], offset| {
+                let _order = install_repl.write_order.lock();
+                let _barrier = install_repl.barrier.write();
+                if install_repl.current_gen() != generation {
+                    return Err(std::io::Error::other("replica sync superseded"));
                 }
+                replace_store_from_bytes(&install_store, bytes).map_err(std::io::Error::other)?;
+                if let Some(aof) = AOF.get() {
+                    match aof.rewrite(&install_store)? {
+                        Some(_) => {}
+                        None => {
+                            return Err(std::io::Error::other("AOF rewrite already in progress"));
+                        }
+                    }
+                }
+                install_repl.set_offset(offset);
+                install_repl.set_link_up(true);
+                Ok(())
             },
-            move |cmd: Vec<Bytes>| {
+            move |cmd: Vec<Bytes>, frame_len| {
+                let _order = repl_apply.write_order.lock();
+                let _barrier = repl_apply.barrier.read();
+                if repl_apply.current_gen() != generation {
+                    return false;
+                }
                 let mut scratch = ConnectionState::new();
                 scratch.authenticated = true;
                 scratch.from_master = true;
@@ -143,6 +175,8 @@ fn spawn_replica_task(store: ShardedStore, host: String, port: u16, generation: 
                 let now = get_timestamp();
                 execute_command(&apply_store, &cmd, &mut w, &mut scratch, now);
                 w.clear(); // discard reply; replica applies silently
+                repl_apply.add_offset(frame_len);
+                true
             },
         )
         .await;
@@ -193,6 +227,10 @@ async fn shutdown_signal() {
 
 // ==================== Background Tasks ====================
 
+/// How long past its expiry a replica waits before reclaiming a key the
+/// primary never sent a DEL for.
+const REPLICA_EXPIRY_GRACE_SECS: u64 = 10;
+
 async fn expiration_task(store: ShardedStore, mut shutdown_rx: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     loop {
@@ -200,18 +238,24 @@ async fn expiration_task(store: ShardedStore, mut shutdown_rx: watch::Receiver<b
             biased;
             _ = shutdown_rx.changed() => break,
             _ = interval.tick() => {
-                // Only the primary actively expires keys and propagates the
-                // deletions. A replica waits for the master's DELs so the two
-                // never diverge (no independent expiry on a replica).
-                if REPLICATION.get().map(|r| r.role()) != Some(replication::Role::Primary) {
-                    continue;
-                }
-                // No barrier here (unlike client writes): an expiry DEL is
-                // idempotent, so it is correct whether it lands in the snapshot,
-                // the live stream, or both. Taking the barrier here would also
-                // contend with a full-sync cut's exclusive guard.
-                let expired = expire_random_keys(&store, 20);
+                // Keep removal and its DEL in the same order as client writes
+                // (and the master stream), and prevent a full-sync cut between
+                // the two.
+                let _order = repl().write_order.lock();
+                let _barrier = repl().barrier.read();
+                let expired = if repl().role() == replication::Role::Primary {
+                    expire_random_keys(&store, 20)
+                } else {
+                    // The primary propagates DELs for keys its active expiry
+                    // removes, but not for keys removed lazily on read. A
+                    // replica reclaims those itself, only after a grace window
+                    // so it never drops a key the primary may still be touching
+                    // (replication lag, clock skew). Reads already hide them.
+                    let cutoff = get_timestamp().saturating_sub(REPLICA_EXPIRY_GRACE_SECS);
+                    expire_random_keys_at(&store, 20, cutoff)
+                };
                 for key in expired {
+                    // On a replica this only reaches the local AOF.
                     on_write(&[Bytes::from_static(b"DEL"), key]);
                 }
             }
@@ -245,12 +289,41 @@ fn execute_command(
         return;
     }
 
+    let cmd = &command[0];
+
+    // When commands are logged or replicated, their mutation and publication
+    // must share one order. With neither enabled, retain the concurrent path.
+    let role_change =
+        cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"SLAVEOF");
+    if state.from_master && role_change {
+        writer.write_error(b"replication stream cannot change role");
+        return;
+    }
+    let needs_order = !state.from_master && is_write_command(cmd);
+    let ordered = || AOF.get().is_some() || REPLICATION.get().is_some_and(|r| r.has_subscribers());
+    let mut _order_guard = if needs_order && ordered() {
+        REPLICATION.get().map(|r| r.write_order.lock())
+    } else {
+        None
+    };
+
     // Hold the replication barrier shared for the whole command so a full-sync
     // cut (which takes it exclusively) sees a quiescent store. Cheap, concurrent
     // read-lock; only contended briefly during a replica's initial sync.
-    let _repl_guard = REPLICATION.get().map(|r| r.barrier.read());
+    let mut _repl_guard = if role_change || state.from_master {
+        None
+    } else {
+        REPLICATION.get().map(|r| r.barrier.read())
+    };
 
-    let cmd = &command[0];
+    // A replica may have subscribed between the check above and taking the
+    // barrier. Re-check under the barrier (no cut can start now); if ordering
+    // became required, reacquire in lock order: write_order, then barrier.
+    if needs_order && _order_guard.is_none() && ordered() {
+        _repl_guard = None;
+        _order_guard = REPLICATION.get().map(|r| r.write_order.lock());
+        _repl_guard = REPLICATION.get().map(|r| r.barrier.read());
+    }
 
     // AUTH and PING don't require authentication
     let requires_auth = !matches!(cmd.len(), 4 if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h')
@@ -281,6 +354,8 @@ fn execute_command(
             return;
         }
         if command[1].eq_ignore_ascii_case(b"NO") && command[2].eq_ignore_ascii_case(b"ONE") {
+            let _order = repl().write_order.lock();
+            let _barrier = repl().barrier.write();
             repl().promote();
             writer.write_simple_string(b"OK");
             return;
@@ -308,6 +383,8 @@ fn execute_command(
             writer.write_error(b"REPLICAOF would create a replication cycle to self");
             return;
         }
+        let _order = repl().write_order.lock();
+        let _barrier = repl().barrier.write();
         let generation = repl().set_master(host.clone(), port);
         spawn_replica_task(store.clone(), host, port, generation);
         writer.write_simple_string(b"OK");
@@ -329,8 +406,9 @@ fn execute_command(
     match cmd.len() {
         3 => {
             if eq_ignore_case_3(cmd, b"set") {
-                handle_set(store, command, writer, now);
-                on_write(command);
+                if handle_set(store, command, writer, now) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_3(cmd, b"ttl") {
@@ -386,13 +464,15 @@ fn execute_command(
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"inc") && (cmd[3] | 0x20) == b'r' {
-                handle_incr(store, command, writer, now, 1);
-                on_write(command);
+                if handle_incr(store, command, writer, now, 1) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"dec") && (cmd[3] | 0x20) == b'r' {
-                handle_incr(store, command, writer, now, -1);
-                on_write(command);
+                if handle_incr(store, command, writer, now, -1) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"ptt") && (cmd[3] | 0x20) == b'l' {
@@ -404,8 +484,9 @@ fn execute_command(
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"mse") && (cmd[3] | 0x20) == b't' {
-                handle_mset(store, command, writer, now);
-                on_write(command);
+                if handle_mset(store, command, writer, now) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_3(&cmd[..3], b"aut") && (cmd[3] | 0x20) == b'h' {
@@ -494,13 +575,15 @@ fn execute_command(
                 return;
             }
             if eq_ignore_case_6(cmd, b"incrby") {
-                handle_incrby(store, command, writer, now);
-                on_write(command);
+                if handle_incrby(store, command, writer, now) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_6(cmd, b"decrby") {
-                handle_decrby(store, command, writer, now);
-                on_write(command);
+                if handle_decrby(store, command, writer, now) {
+                    on_write(command);
+                }
                 return;
             }
             if eq_ignore_case_6(cmd, b"expire") {
@@ -691,17 +774,21 @@ fn handle_bgrewriteaof(store: &ShardedStore, writer: &mut RespWriter) {
     }
     let aof_c = aof.clone();
     let store_c = store.clone();
+    let repl_c = repl().clone();
     // Best effort: only succeeds if a tokio runtime is attached to the calling
     // thread. In our server that is always the case.
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            handle.spawn_blocking(move || match aof_c.rewrite(&store_c) {
-                Ok(Some(stats)) => eprintln!(
-                    "AOF rewrite: {} keys, {} -> {} bytes",
-                    stats.keys_written, stats.previous_bytes, stats.bytes_written
-                ),
-                Ok(None) => {} // concurrent rewrite won the race
-                Err(e) => eprintln!("AOF rewrite failed: {}", e),
+            handle.spawn_blocking(move || {
+                let _barrier = repl_c.barrier.write();
+                match aof_c.rewrite(&store_c) {
+                    Ok(Some(stats)) => eprintln!(
+                        "AOF rewrite: {} keys, {} -> {} bytes",
+                        stats.keys_written, stats.previous_bytes, stats.bytes_written
+                    ),
+                    Ok(None) => {} // concurrent rewrite won the race
+                    Err(e) => eprintln!("AOF rewrite failed: {}", e),
+                }
             });
             writer.write_simple_string(b"Background append only file rewriting started");
         }
@@ -714,10 +801,10 @@ fn handle_bgrewriteaof(store: &ShardedStore, writer: &mut RespWriter) {
 // ==================== Command Handlers ====================
 
 #[inline(always)]
-fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) -> bool {
     if command.len() < 3 {
         writer.write_error(b"wrong number of arguments");
-        return;
+        return false;
     }
 
     let key = &command[1];
@@ -726,9 +813,9 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
 
     // Replicas never evict on their own — the master's stream is authoritative,
     // so a replica keeps whatever the master sends (ignores maxmemory).
-    if repl().role() == replication::Role::Primary && !evict_if_needed(store, size) {
+    if !allow_write_after_eviction(store, size) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
-        return;
+        return false;
     }
 
     let mut ttl: Option<u64> = None;
@@ -745,27 +832,27 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
             if o0 == b'e' && o1 == b'x' {
                 if i + 1 >= command.len() {
                     writer.write_error(b"syntax error");
-                    return;
+                    return false;
                 }
                 i += 1;
                 match parse_u64(&command[i]) {
                     Some(v) if v > 0 => ttl = Some(v),
                     _ => {
                         writer.write_error(b"value is not an integer or out of range");
-                        return;
+                        return false;
                     }
                 }
             } else if o0 == b'p' && o1 == b'x' {
                 if i + 1 >= command.len() {
                     writer.write_error(b"syntax error");
-                    return;
+                    return false;
                 }
                 i += 1;
                 match parse_u64(&command[i]) {
                     Some(v) if v > 0 => ttl = Some(v.div_ceil(1000)),
                     _ => {
                         writer.write_error(b"value is not an integer or out of range");
-                        return;
+                        return false;
                     }
                 }
             } else if o0 == b'n' && o1 == b'x' {
@@ -774,7 +861,7 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
                 xx = true;
             } else {
                 writer.write_error(b"syntax error");
-                return;
+                return false;
             }
         } else if opt.len() == 3
             && (opt[0] | 0x20) == b'g'
@@ -784,14 +871,14 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
             get = true;
         } else {
             writer.write_error(b"syntax error");
-            return;
+            return false;
         }
         i += 1;
     }
 
     if nx && xx {
         writer.write_error(b"XX and NX options at the same time are not compatible");
-        return;
+        return false;
     }
 
     let shard = &store.shards[store.hash(key)];
@@ -825,12 +912,12 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
         } else {
             writer.write_null();
         }
-        return;
+        return false;
     }
 
     if xx && !key_exists {
         writer.write_null();
-        return;
+        return false;
     }
 
     let old_size = store.set(key.clone(), value.clone(), ttl, now);
@@ -850,6 +937,7 @@ fn handle_set(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, 
     } else {
         writer.write_simple_string(b"OK");
     }
+    true
 }
 
 #[inline(always)]
@@ -937,10 +1025,10 @@ fn handle_incr(
     writer: &mut RespWriter,
     now: u64,
     delta: i64,
-) {
+) -> bool {
     if command.len() < 2 {
         writer.write_error(b"wrong number of arguments");
-        return;
+        return false;
     }
     let key = &command[1];
     let shard = &store.shards[store.hash(key)];
@@ -955,7 +1043,7 @@ fn handle_incr(
                     writer.write_error(
                         b"WRONGTYPE Operation against a key holding the wrong kind of value",
                     );
-                    return;
+                    return false;
                 }
             };
 
@@ -981,7 +1069,7 @@ fn handle_incr(
                         Some(v) => v,
                         None => {
                             writer.write_error(b"value is not an integer or out of range");
-                            return;
+                            return false;
                         }
                     };
                     let ttl = Some(expiry.saturating_sub(now));
@@ -994,7 +1082,7 @@ fn handle_incr(
                     Some(v) => v,
                     None => {
                         writer.write_error(b"value is not an integer or out of range");
-                        return;
+                        return false;
                     }
                 };
                 let old_size = store::calculate_entry_size(key.len(), &entry.value);
@@ -1009,7 +1097,7 @@ fn handle_incr(
             Some(v) => v,
             None => {
                 writer.write_error(b"increment would produce overflow");
-                return;
+                return false;
             }
         }
     } else {
@@ -1017,7 +1105,7 @@ fn handle_incr(
             Some(v) => v,
             None => {
                 writer.write_error(b"decrement would produce overflow");
-                return;
+                return false;
             }
         }
     };
@@ -1027,12 +1115,9 @@ fn handle_incr(
 
     let net_size = size.saturating_sub(old_size_for_eviction);
 
-    if repl().role() == replication::Role::Primary
-        && net_size > 0
-        && !evict_if_needed(store, net_size)
-    {
+    if net_size > 0 && !allow_write_after_eviction(store, net_size) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
-        return;
+        return false;
     }
 
     let old_size = store.set(key.clone(), val_bytes, existing_ttl, now);
@@ -1045,45 +1130,56 @@ fn handle_incr(
     }
 
     writer.write_signed_integer(new_val);
+    true
 }
 
 #[inline(always)]
-fn handle_incrby(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+fn handle_incrby(
+    store: &ShardedStore,
+    command: &[Bytes],
+    writer: &mut RespWriter,
+    now: u64,
+) -> bool {
     if command.len() < 3 {
         writer.write_error(b"wrong number of arguments");
-        return;
+        return false;
     }
     let increment = match parse_i64(&command[2]) {
         Some(v) => v,
         None => {
             writer.write_error(b"value is not an integer or out of range");
-            return;
+            return false;
         }
     };
-    handle_incr(store, command, writer, now, increment);
+    handle_incr(store, command, writer, now, increment)
 }
 
 #[inline(always)]
-fn handle_decrby(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+fn handle_decrby(
+    store: &ShardedStore,
+    command: &[Bytes],
+    writer: &mut RespWriter,
+    now: u64,
+) -> bool {
     if command.len() < 3 {
         writer.write_error(b"wrong number of arguments");
-        return;
+        return false;
     }
     let decrement = match parse_i64(&command[2]) {
         Some(v) => v,
         None => {
             writer.write_error(b"value is not an integer or out of range");
-            return;
+            return false;
         }
     };
     // Check for overflow: -i64::MIN cannot be represented as i64
     let delta = if decrement == i64::MIN {
         writer.write_error(b"value is not an integer or out of range");
-        return;
+        return false;
     } else {
         -decrement
     };
-    handle_incr(store, command, writer, now, delta);
+    handle_incr(store, command, writer, now, delta)
 }
 
 #[inline(always)]
@@ -1102,10 +1198,10 @@ fn handle_mget(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
 }
 
 #[inline(always)]
-fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) {
+fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter, now: u64) -> bool {
     if command.len() < 3 || !(command.len() - 1).is_multiple_of(2) {
         writer.write_error(b"wrong number of arguments for MSET");
-        return;
+        return false;
     }
 
     let pairs = (command.len() - 1) / 2;
@@ -1122,12 +1218,9 @@ fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
     }
 
     // Only evict if net increase is positive
-    if repl().role() == replication::Role::Primary
-        && net_size > 0
-        && !evict_if_needed(store, net_size as usize)
-    {
+    if net_size > 0 && !allow_write_after_eviction(store, net_size as usize) {
         writer.write_error(b"OOM command not allowed when used memory > 'maxmemory'");
-        return;
+        return false;
     }
 
     for i in 0..pairs {
@@ -1145,6 +1238,7 @@ fn handle_mset(store: &ShardedStore, command: &[Bytes], writer: &mut RespWriter,
     }
 
     writer.write_simple_string(b"OK");
+    true
 }
 
 fn handle_auth(command: &[Bytes], writer: &mut RespWriter, state: &mut ConnectionState) {
@@ -1622,24 +1716,32 @@ async fn main() {
         config.replication.repl_backlog_size,
     )));
 
-    // Start replicating from a master if configured.
-    if !CONFIG.replication.replicaof.is_empty() {
+    // Establish the role before local AOF replay (which must bypass primary
+    // eviction), but do not connect until replay and AOF initialization finish.
+    let startup_master = if CONFIG.replication.replicaof.is_empty() {
+        None
+    } else {
         match CONFIG.replication.replicaof.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {
                 Ok(port) => {
                     let host = h.to_string();
                     let generation = repl().set_master(host.clone(), port);
-                    spawn_replica_task(store.clone(), host, port, generation);
-                    println!("replicating from {}:{}", h, port);
+                    Some((host, port, generation))
                 }
-                Err(_) => eprintln!("invalid replicaof port: {}", p),
+                Err(_) => {
+                    eprintln!("invalid replicaof port: {}", p);
+                    None
+                }
             },
-            None => eprintln!(
-                "invalid replicaof (expected host:port): {}",
-                CONFIG.replication.replicaof
-            ),
+            None => {
+                eprintln!(
+                    "invalid replicaof (expected host:port): {}",
+                    CONFIG.replication.replicaof
+                );
+                None
+            }
         }
-    }
+    };
 
     // Force START_TIME initialization
     let _ = *START_TIME;
@@ -1808,6 +1910,14 @@ async fn main() {
         }
     }
 
+    // Restore local persistence before starting the outbound replica task.
+    // Otherwise a full sync on another runtime worker can race with startup
+    // snapshot/AOF replay and overlay stale local keys on the master's image.
+    if let Some((host, port, generation)) = startup_master {
+        spawn_replica_task(store.clone(), host.clone(), port, generation);
+        println!("replicating from {}:{}", host, port);
+    }
+
     // Load TLS configuration if enabled
     let tls_acceptor = if config.security.tls_enabled {
         if config.security.tls_cert_path.is_empty() || config.security.tls_key_path.is_empty() {
@@ -1912,6 +2022,7 @@ async fn main() {
         tokio::spawn(aof::rewrite_supervisor_task(
             aof_handle.clone(),
             store.clone(),
+            repl().clone(),
             config.persistence.aof_rewrite_min_size,
             config.persistence.aof_rewrite_percentage,
             shutdown_tx.subscribe(),

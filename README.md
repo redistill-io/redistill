@@ -27,6 +27,7 @@ Redistill is:
 - **5x lower latency** (p50: 0.48ms vs Redis 2.38ms)
 - Multi-threaded architecture with lock-free reads
 - **Optional persistence** - RDB snapshots and/or AOF (append-only file) with configurable fsync; both disabled by default for max performance
+- **Asynchronous replication** - Redistill primary to Redistill replica, with full sync and manual promotion
 - **Graceful shutdown** - honours SIGTERM/SIGINT with configurable drain window (Kubernetes-ready)
 - Production-ready security and monitoring features
 
@@ -168,7 +169,7 @@ Redistill is a high-performance key-value database perfect for applications requ
 ### Not Recommended For
 
 - **Financial or transactional data** (use ACID-compliant database — Redistill has no multi-key transactions)
-- **Workloads requiring replication/HA today** (replication is on the roadmap, not shipped)
+- **Workloads requiring automatic failover or zero acknowledged-write loss** (replication is asynchronous and promotion is manual)
 
 With `aof_enabled = true` and `aof_fsync = "always"`, Redistill provides per-write fsync durability — similar guarantees to Redis AOF. `everysec` (default when AOF is enabled) bounds loss to ~1 second.
 
@@ -307,6 +308,12 @@ aof_fsync = "everysec"            # "always" | "everysec" (default) | "no"
 aof_rewrite_min_size = 67108864   # Min log size (bytes) before auto-rewrite (64 MiB)
 aof_rewrite_percentage = 100      # Rewrite when log has doubled since last rewrite (0 = manual only)
 
+[replication]
+replicaof = ""                     # Set to "primary-host:6379" on a replica
+masterauth = ""                    # Primary password, if authentication is enabled
+replica_read_only = true           # Reject client writes on a replica
+repl_backlog_size = 1048576        # Live stream buffer capacity in commands
+
 [server]
 # ... plus a shutdown knob that governs SIGTERM drain:
 shutdown_grace_period_secs = 30   # Max seconds to drain in-flight connections
@@ -318,6 +325,12 @@ shutdown_grace_period_secs = 30   # Max seconds to drain in-flight connections
 - `eviction_policy`: "allkeys-lru", "allkeys-random", "allkeys-s3fifo", or "noeviction"
 
 > 📖 See [Configuration Reference](docs/CONFIG.md) for all options and [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) for optimization.
+
+### Replication
+
+Set `[replication] replicaof = "primary-host:6379"` on a replica, or run it with `REDIS_REPLICAOF=primary-host:6379`. Use `REDIS_MASTERAUTH` if the primary requires a password. `INFO` reports the role, link status, and replication offset. To promote a replica manually, send `REPLICAOF NO ONE` to it and redirect clients to the promoted node.
+
+Replication is Redistill-to-Redistill, asynchronous, and uses a full snapshot on every connection or reconnect. Recent writes can be lost during failover; there is no automatic failover, partial resync, or Redis-server replication compatibility. The outbound replica connection currently uses plain TCP, so a replica cannot connect directly to a TLS-only primary. Keep replication traffic on a trusted private network or use a TLS tunnel; `masterauth` is sent on that connection.
 
 ## Supported Commands
 
@@ -453,13 +466,13 @@ A: Yes. Redistill includes authentication, TLS, memory limits, connection limits
 A: Yes, for caching workloads. Redistill implements the Redis protocol and supports optional snapshot persistence for warm restarts. Review the [Features](docs/FEATURES.md) document for command compatibility.
 
 **Q: How do I handle high availability?**  
-A: Use client-side sharding or a proxy like Twemproxy. Clustering support is on the roadmap.
+A: Redistill supports asynchronous primary-to-replica replication with manual promotion. Use client-side sharding or a proxy for distribution; clustering and automatic failover are not included.
 
 **Q: What about memory management?**  
 A: Configure `max_memory` and `eviction_policy` in the configuration. Redistill automatically evicts keys when the limit is reached.
 
 **Q: When should I use Redis instead?**  
-A: Use Redis if you need replication, clustering, or the full Redis data-type surface (lists, sets, sorted sets, streams, pub/sub). Redistill now supports both RDB snapshots and AOF (append-only file) with configurable fsync, so real-time durability is no longer a Redis-only feature.
+A: Use Redis if you need automatic failover, Redis-server replication compatibility, clustering, or the full Redis data-type surface (lists, sets, sorted sets, streams, pub/sub). Redistill supports manual primary-to-replica replication and optional RDB/AOF persistence.
 
 **Q: Is it stable?**  
 A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and production workloads. All core functionality is stable.
@@ -474,7 +487,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 | Latency (p50) | **0.48ms** | 0.81ms | 2.38ms |
 | Concurrency model | Multi-threaded | Multi-threaded | Single-threaded |
 | Persistence | Yes (RDB + AOF, both optional) | Yes (AOF/RDB) | Yes (AOF/RDB) |
-| Replication | No | Yes | Yes |
+| Replication | Async, manual promotion | Yes | Yes |
 | Clustering | No (manual sharding) | Yes | Yes (Redis Cluster) |
 | Data types | String (KV) + Hash | Full Redis | Full Redis |
 | Best for | High-performance KV workloads | General purpose | General purpose |
@@ -490,7 +503,7 @@ A: Yes. Redistill has been tested with redis-benchmark, memtier_benchmark, and p
 - Maximum throughput and minimum latency
 
 **When to Use Redis/Dragonfly:**
-- Need replication / HA (on Redistill's roadmap, not yet shipped)
+- Need automatic failover, partial resync, or Redis-server replication compatibility
 - Need clustering
 - Complex data structures required (lists, sets, sorted sets, streams, pub/sub)
 - Established ecosystem and tooling critical

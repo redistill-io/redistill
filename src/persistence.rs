@@ -301,8 +301,64 @@ pub fn load_snapshot(store: &ShardedStore, path: &str) -> Result<usize, String> 
 /// Load a store from a byte slice produced by [`dump_store_to_bytes`].
 #[allow(dead_code)]
 pub fn load_store_from_bytes(store: &ShardedStore, data: &[u8]) -> Result<usize, String> {
+    // Validate the whole payload before touching the live store. A failed
+    // full sync must never leave a prefix of the master's keys installed.
+    validate_snapshot_bytes(data, false)?;
     let mut cur = std::io::Cursor::new(data);
     read_snapshot(&mut cur, store)
+}
+
+/// Install a validated full-sync image. Callers must exclude client commands
+/// while this replaces the store and its memory/eviction accounting.
+pub fn replace_store_from_bytes(store: &ShardedStore, data: &[u8]) -> Result<usize, String> {
+    validate_snapshot_bytes(data, true)?;
+    store.clear_for_replication();
+    let mut cur = std::io::Cursor::new(data);
+    let count = read_snapshot(&mut cur, store)?;
+    store.rebuild_eviction_queues();
+    Ok(count)
+}
+
+fn validate_snapshot_bytes(data: &[u8], exact_count: bool) -> Result<(), String> {
+    const HEADER_LEN: usize = 4 + 1 + 8 + 8;
+    if data.len() < HEADER_LEN || &data[..4] != SNAPSHOT_MAGIC {
+        return Err("Invalid snapshot payload (bad header)".to_string());
+    }
+    if data[4] != SNAPSHOT_VERSION {
+        return Err(format!("Unsupported snapshot version: {}", data[4]));
+    }
+
+    let entry_count = u64::from_le_bytes(data[13..21].try_into().unwrap());
+    let mut pos = HEADER_LEN;
+    for _ in 0..entry_count {
+        // The header count is an upper bound: an entry may have expired after
+        // the key list was captured. A full-sync snapshot is captured under
+        // the barrier, so its count must be exact.
+        if pos == data.len() {
+            return if exact_count {
+                Err("Truncated full-sync snapshot".to_string())
+            } else {
+                Ok(())
+            };
+        }
+        let end_prefix = pos.checked_add(4).ok_or("Snapshot entry length overflow")?;
+        let prefix = data
+            .get(pos..end_prefix)
+            .ok_or("Truncated snapshot entry length")?;
+        let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
+        pos = end_prefix;
+        let end_entry = pos.checked_add(len).ok_or("Snapshot entry overflow")?;
+        let entry = data.get(pos..end_entry).ok_or("Truncated snapshot entry")?;
+        if bincode::deserialize::<SnapshotEntry>(entry).is_err() {
+            bincode::deserialize::<LegacySnapshotEntry>(entry)
+                .map_err(|e| format!("Invalid snapshot entry: {e}"))?;
+        }
+        pos = end_entry;
+    }
+    if pos != data.len() {
+        return Err("Trailing bytes in snapshot payload".to_string());
+    }
+    Ok(())
 }
 
 // ==================== Background Snapshot Task ====================
@@ -391,5 +447,68 @@ mod tests {
             dst.hget(b"h1", b"f1", now2).unwrap(),
             Some(Bytes::from_static(b"hv1"))
         );
+    }
+
+    #[test]
+    fn malformed_replica_dump_does_not_partially_load() {
+        let src = ShardedStore::new(2);
+        let now = get_timestamp();
+        src.set(
+            Bytes::from_static(b"one"),
+            Bytes::from_static(b"1"),
+            None,
+            now,
+        );
+        src.set(
+            Bytes::from_static(b"two"),
+            Bytes::from_static(b"2"),
+            None,
+            now,
+        );
+        let mut dump = dump_store_to_bytes(&src).unwrap();
+        dump.truncate(dump.len() - 3);
+
+        let dst = ShardedStore::new(2);
+        dst.set(
+            Bytes::from_static(b"keep"),
+            Bytes::from_static(b"yes"),
+            None,
+            now,
+        );
+        assert!(load_store_from_bytes(&dst, &dump).is_err());
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst.get(b"keep", now), Some(Bytes::from_static(b"yes")));
+    }
+
+    #[test]
+    fn full_sync_rejects_clean_prefix_of_snapshot() {
+        let src = ShardedStore::new(2);
+        let now = get_timestamp();
+        src.set(
+            Bytes::from_static(b"one"),
+            Bytes::from_static(b"1"),
+            None,
+            now,
+        );
+        src.set(
+            Bytes::from_static(b"two"),
+            Bytes::from_static(b"2"),
+            None,
+            now,
+        );
+        let mut dump = dump_store_to_bytes(&src).unwrap();
+        let first_len = u32::from_le_bytes(dump[21..25].try_into().unwrap()) as usize;
+        dump.truncate(25 + first_len);
+
+        let dst = ShardedStore::new(2);
+        dst.set(
+            Bytes::from_static(b"keep"),
+            Bytes::from_static(b"yes"),
+            None,
+            now,
+        );
+        assert!(replace_store_from_bytes(&dst, &dump).is_err());
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst.get(b"keep", now), Some(Bytes::from_static(b"yes")));
     }
 }

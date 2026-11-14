@@ -69,11 +69,11 @@ aof_rewrite_percentage = 100      # rewrite when log is this % larger than after
 
 [replication]
 # Asynchronous primary→replica replication (v1: async-only, full-resync-only,
-# manual promotion via `REPLICAOF NO ONE`).
+# manual promotion via `REPLICAOF NO ONE`). The outbound replica link uses
+# plain TCP; use a trusted network or TLS tunnel, particularly with masterauth.
 replicaof = ""                    # "host:port" to start as a replica of that primary; empty = act as primary
                                   # Can be overridden with REDIS_REPLICAOF env var
 masterauth = ""                   # Password used when authenticating to the primary (if it requires auth)
 replica_read_only = true          # Reject client writes while acting as a replica (returns -READONLY)
 repl_backlog_size = 1048576       # Broadcast lag-buffer capacity (messages); a replica that lags past this
                                   # is dropped and performs a full resync on reconnect
-

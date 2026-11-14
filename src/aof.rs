@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::replication::Replication;
 use crate::store::{EntryValue, ShardedStore, get_timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,7 +292,9 @@ fn write_store_snapshot(
         .open(temp_path)?;
     let mut w = BufWriter::with_capacity(256 * 1024, file);
     let mut keys: u64 = 0;
-    let mut bytes: u64 = 0;
+    // Startup loads an RDB before replaying the AOF. A rewritten AOF must
+    // replace that base, including keys removed since the RDB was saved.
+    let mut bytes = write_resp_array_raw(&mut w, &[b"FLUSHALL"])? as u64;
 
     for shard in &store.shards {
         // Iterating a DashMap holds per-bucket locks briefly; writers to
@@ -477,6 +480,7 @@ fn parse_num(bytes: &[u8]) -> io::Result<usize> {
 pub async fn rewrite_supervisor_task(
     aof: Arc<Aof>,
     store: ShardedStore,
+    repl: Arc<Replication>,
     min_size: u64,
     percentage: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -494,7 +498,9 @@ pub async fn rewrite_supervisor_task(
                 if aof.should_rewrite(min_size, percentage) && !aof.is_rewriting() {
                     let aof_c = aof.clone();
                     let store_c = store.clone();
+                    let repl_c = repl.clone();
                     tokio::task::spawn_blocking(move || {
+                        let _barrier = repl_c.barrier.write();
                         match aof_c.rewrite(&store_c) {
                             Ok(Some(stats)) => {
                                 eprintln!(

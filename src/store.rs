@@ -667,6 +667,40 @@ impl ShardedStore {
         }
     }
 
+    /// Clear all store state before installing a master's full snapshot.
+    /// The caller holds the replication barrier exclusively.
+    pub fn clear_for_replication(&self) {
+        self.clear();
+        MEMORY_USED.store(0, Ordering::Relaxed);
+        for queues in &self.s3fifo_queues {
+            let mut q = queues.write().unwrap();
+            q.small_queue.clear();
+            q.main_queue.clear();
+            q.ghost_queue.clear();
+            q.small_set.clear();
+            q.main_set.clear();
+            q.ghost_set.clear();
+        }
+    }
+
+    /// Rebuild S3-FIFO's lookup queues after snapshot loading, which inserts
+    /// directly into the shards rather than using `set` / `hset`.
+    pub fn rebuild_eviction_queues(&self) {
+        if *EVICTION_POLICY != EvictionPolicy::AllKeysS3Fifo {
+            return;
+        }
+        for (idx, shard) in self.shards.iter().enumerate() {
+            let mut queues = self.s3fifo_queues[idx].write().unwrap();
+            for entry in shard.iter() {
+                queues.add_to_small(entry.key().clone());
+                entry
+                    .value()
+                    .queue_type
+                    .store(QueueType::Small as u8, Ordering::Relaxed);
+            }
+        }
+    }
+
     // ==================== Hash Operations ====================
 
     /// Set one or more field-value pairs in a hash
@@ -1096,22 +1130,32 @@ fn maybe_update_access_time(entry: &dashmap::mapref::one::Ref<'_, Bytes, Entry>)
 // ==================== Eviction ====================
 
 #[inline(always)]
-pub fn evict_if_needed(store: &ShardedStore, needed_size: usize) -> bool {
+pub fn evict_if_needed(store: &ShardedStore, needed_size: usize) -> EvictionResult {
+    let mut keys = Vec::new();
     let max_memory = CONFIG.memory.max_memory;
 
     if max_memory == 0 {
-        return true;
+        return EvictionResult {
+            allowed: true,
+            keys,
+        };
     }
 
     let current = MEMORY_USED.load(Ordering::Relaxed);
     if current + needed_size as u64 <= max_memory {
-        return true;
+        return EvictionResult {
+            allowed: true,
+            keys,
+        };
     }
 
     let policy = *EVICTION_POLICY;
 
     if policy == EvictionPolicy::NoEviction {
-        return false;
+        return EvictionResult {
+            allowed: false,
+            keys,
+        };
     }
 
     let mut freed = 0;
@@ -1128,19 +1172,29 @@ pub fn evict_if_needed(store: &ShardedStore, needed_size: usize) -> bool {
             EvictionPolicy::NoEviction => break,
         };
 
-        if evicted == 0 {
-            break;
+        match evicted {
+            Some((size, key)) => {
+                freed += size;
+                keys.push(key);
+            }
+            None => break,
         }
-
-        freed += evicted;
     }
 
     let final_used = MEMORY_USED.load(Ordering::Relaxed);
-    final_used + needed_size as u64 <= max_memory
+    EvictionResult {
+        allowed: final_used + needed_size as u64 <= max_memory,
+        keys,
+    }
+}
+
+pub struct EvictionResult {
+    pub allowed: bool,
+    pub keys: Vec<Bytes>,
 }
 
 #[inline]
-fn evict_lru(store: &ShardedStore) -> usize {
+fn evict_lru(store: &ShardedStore) -> Option<(usize, Bytes)> {
     let sample_size = CONFIG.memory.eviction_sample_size;
 
     let mut oldest_key: Option<Bytes> = None;
@@ -1175,22 +1229,22 @@ fn evict_lru(store: &ShardedStore) -> usize {
             let size = calculate_entry_size(key_len, &entry.value);
             MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
             EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
-            return size;
+            return Some((size, key));
         }
     }
 
-    0
+    None
 }
 
 #[inline]
-fn evict_random(store: &ShardedStore) -> usize {
+fn evict_random(store: &ShardedStore) -> Option<(usize, Bytes)> {
     let shard_idx = fastrand::usize(..store.num_shards);
     let shard = &store.shards[shard_idx];
 
     // Sample a random entry from the shard
     let len = shard.len();
     if len == 0 {
-        return 0;
+        return None;
     }
     let skip = fastrand::usize(..len);
     if let Some(entry) = shard.iter().nth(skip) {
@@ -1202,15 +1256,15 @@ fn evict_random(store: &ShardedStore) -> usize {
             let size = calculate_entry_size(key_len, &entry.value);
             MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
             EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
-            return size;
+            return Some((size, key));
         }
     }
 
-    0
+    None
 }
 
 #[inline]
-fn evict_s3fifo(store: &ShardedStore) -> usize {
+fn evict_s3fifo(store: &ShardedStore) -> Option<(usize, Bytes)> {
     // Try each shard until we find one with items to evict
     for _ in 0..store.num_shards {
         let shard_idx = fastrand::usize(..store.num_shards);
@@ -1254,20 +1308,26 @@ fn evict_s3fifo(store: &ShardedStore) -> usize {
                 let size = calculate_entry_size(key_len, &entry.value);
                 MEMORY_USED.fetch_sub(size as u64, Ordering::Relaxed);
                 EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
-                return size;
+                return Some((size, key));
             }
         }
     }
 
-    0
+    None
 }
 
 // Expire random keys (passive expiration)
 /// Sample `count` random entries and remove any that have expired. Returns the
 /// keys actually removed so the caller (primary) can propagate explicit DELs to
-/// replicas and the AOF — replicas must not expire independently.
+/// replicas and the AOF.
 pub fn expire_random_keys(store: &ShardedStore, count: usize) -> Vec<Bytes> {
-    let now = get_timestamp();
+    expire_random_keys_at(store, count, get_timestamp())
+}
+
+/// Like [`expire_random_keys`], but treats `now` as the current time. A replica
+/// passes a time in the past so it only reclaims keys the primary has had ample
+/// time to delete (lazily expired keys produce no DEL on the stream).
+pub fn expire_random_keys_at(store: &ShardedStore, count: usize, now: u64) -> Vec<Bytes> {
     let mut expired: Vec<Bytes> = Vec::new();
 
     for _ in 0..count {
@@ -1442,7 +1502,7 @@ mod tests {
         }
 
         let evicted = evict_s3fifo(&store);
-        assert!(evicted > 0);
+        assert!(evicted.is_some());
 
         {
             let q = queues.read().unwrap();
