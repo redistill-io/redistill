@@ -230,6 +230,13 @@ impl RespWriter {
     }
 
     #[inline(always)]
+    pub fn write_error_raw(&mut self, msg: &[u8]) {
+        self.buffer.push(b'-');
+        self.buffer.extend_from_slice(msg);
+        self.buffer.extend_from_slice(b"\r\n");
+    }
+
+    #[inline(always)]
     pub fn write_array(&mut self, arr: &[Bytes]) {
         self.buffer.push(b'*');
         self.write_u64(arr.len() as u64);

@@ -118,6 +118,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 // ==================== Default Functions ====================
@@ -191,6 +193,18 @@ fn default_aof_rewrite_min_size() -> u64 {
 fn default_aof_rewrite_percentage() -> u64 {
     100
 }
+fn default_replicaof() -> String {
+    String::new()
+}
+fn default_masterauth() -> String {
+    String::new()
+}
+fn default_replica_read_only() -> bool {
+    true
+}
+fn default_repl_backlog_size() -> usize {
+    1_048_576
+}
 
 // ==================== Default Implementations ====================
 
@@ -254,6 +268,33 @@ impl Default for PersistenceConfig {
             aof_fsync: default_aof_fsync(),
             aof_rewrite_min_size: default_aof_rewrite_min_size(),
             aof_rewrite_percentage: default_aof_rewrite_percentage(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationConfig {
+    /// "host:port" of the primary to replicate from. Empty = act as primary.
+    #[serde(default = "default_replicaof")]
+    pub replicaof: String,
+    /// Password used when authenticating to the primary.
+    #[serde(default = "default_masterauth")]
+    pub masterauth: String,
+    /// Reject client writes while acting as a replica.
+    #[serde(default = "default_replica_read_only")]
+    pub replica_read_only: bool,
+    /// Broadcast lag-buffer capacity (messages) before a slow replica is dropped.
+    #[serde(default = "default_repl_backlog_size")]
+    pub repl_backlog_size: usize,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            replicaof: default_replicaof(),
+            masterauth: default_masterauth(),
+            replica_read_only: default_replica_read_only(),
+            repl_backlog_size: default_repl_backlog_size(),
         }
     }
 }
@@ -430,6 +471,23 @@ impl Config {
             config.persistence.aof_rewrite_percentage = v;
         }
 
+        if let Ok(v) = std::env::var("REDIS_REPLICAOF") {
+            config.replication.replicaof = v;
+        }
+        if let Ok(v) = std::env::var("REDIS_MASTERAUTH") {
+            config.replication.masterauth = v;
+        }
+        if let Ok(v) = std::env::var("REDIS_REPLICA_READ_ONLY")
+            && let Ok(b) = v.parse()
+        {
+            config.replication.replica_read_only = b;
+        }
+        if let Ok(v) = std::env::var("REDIS_REPL_BACKLOG_SIZE")
+            && let Ok(n) = v.parse()
+        {
+            config.replication.repl_backlog_size = n;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -470,5 +528,19 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.2}KB", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replication_config_defaults() {
+        let c = ReplicationConfig::default();
+        assert_eq!(c.replicaof, "");
+        assert_eq!(c.masterauth, "");
+        assert!(c.replica_read_only);
+        assert_eq!(c.repl_backlog_size, 1_048_576);
     }
 }

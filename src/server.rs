@@ -178,12 +178,18 @@ pub async fn start_health_check_server(
 
 pub struct ConnectionState {
     pub authenticated: bool,
+    /// True only for the internal replica-apply path; bypasses the read-only gate.
+    pub from_master: bool,
+    /// Replica's advertised listening port (from REPLCONF listening-port).
+    pub replconf_port: Option<u16>,
 }
 
 impl ConnectionState {
     pub fn new() -> Self {
         Self {
             authenticated: CONFIG.security.password.is_empty(),
+            from_master: false,
+            replconf_port: None,
         }
     }
 }
